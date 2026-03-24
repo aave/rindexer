@@ -1,6 +1,8 @@
 use deadpool::managed::PoolError;
-use deadpool_lapin::{Manager, Pool};
-use lapin::{options::*, types::FieldTable, BasicProperties, ConnectionProperties, ExchangeKind};
+use deadpool_lapin::{lapin, Manager, Pool};
+use lapin::{
+    options::*, types::FieldTable, BasicProperties, ConnectionProperties,
+};
 use serde_json::Value;
 
 use crate::manifest::stream::ExchangeKindWrapper;
@@ -25,7 +27,10 @@ pub struct RabbitMQ {
 impl RabbitMQ {
     pub async fn new(uri: &str) -> Self {
         let manager = Manager::new(uri, ConnectionProperties::default());
-        let pool = Pool::builder(manager).max_size(16).build().expect("Failed to create pool");
+        let pool = Pool::builder(manager)
+            .max_size(16)
+            .build()
+            .expect("Failed to create pool");
 
         Self { pool }
     }
@@ -46,7 +51,13 @@ impl RabbitMQ {
         channel
             .exchange_declare(
                 exchange,
-                exchange_type.0.clone(),
+                match &exchange_type.0 {
+                    lapin::ExchangeKind::Direct => lapin::ExchangeKind::Direct,
+                    lapin::ExchangeKind::Fanout => lapin::ExchangeKind::Fanout,
+                    lapin::ExchangeKind::Topic => lapin::ExchangeKind::Topic,
+                    lapin::ExchangeKind::Headers => lapin::ExchangeKind::Headers,
+                    lapin::ExchangeKind::Custom(s) => lapin::ExchangeKind::Custom(s.clone()),
+                },
                 ExchangeDeclareOptions::default(),
                 FieldTable::default(),
             )
@@ -55,9 +66,11 @@ impl RabbitMQ {
         channel
             .basic_publish(
                 exchange,
-                match exchange_type.0 {
-                    ExchangeKind::Fanout => "", // Fanout exchange ignores the routing key
-                    _ => routing_key.as_ref().expect("Routing key should be defined"),
+                match &exchange_type.0 {
+                    lapin::ExchangeKind::Fanout => "", // Fanout exchange ignores the routing key
+                    _ => routing_key
+                        .as_ref()
+                        .expect("Routing key should be defined"),
                 },
                 BasicPublishOptions::default(),
                 &message_body,
