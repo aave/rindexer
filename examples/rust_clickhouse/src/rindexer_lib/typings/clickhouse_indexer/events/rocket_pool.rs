@@ -377,7 +377,13 @@ where
                             .iter()
                             .find(|n| n.name == c.network)
                             .map_or(false, |n| n.disable_logs_bloom_checks.unwrap_or_default()),
-                        reorg_safe_distance: contract_details.reorg_safe_distance.or_else(|| rindexer_yaml.networks.iter().find(|n| n.name == c.network).and_then(|n| n.reorg_safe_distance)),
+                        reorg_safe_distance: contract_details.reorg_safe_distance.or_else(|| {
+                            rindexer_yaml
+                                .networks
+                                .iter()
+                                .find(|n| n.name == c.network)
+                                .and_then(|n| n.reorg_safe_distance)
+                        }),
                     }
                 })
                 .collect(),
@@ -414,9 +420,15 @@ where
             tables: Arc::new(vec![]),
             reorg_sender,
             streams_clients: Arc::new(None),
-            providers: Arc::new(HashMap::new()),
-            constants: Arc::new(HashMap::new()),
-            multicall_addresses: Arc::new(HashMap::new()),
+            providers: Arc::new(providers),
+            constants: Arc::new(rindexer_yaml.constants.clone()),
+            multicall_addresses: Arc::new(
+                rindexer_yaml
+                    .networks
+                    .iter()
+                    .map(|n| (n.name.clone(), n.multicall3_address.clone()))
+                    .collect(),
+            ),
         });
     }
 }
