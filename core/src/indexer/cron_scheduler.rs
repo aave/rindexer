@@ -298,7 +298,7 @@ impl CronScheduler {
                             }
                         }
                     } else if let Some(cron_expr) = &cron_entry.schedule {
-                        match croner::Cron::new(cron_expr).parse() {
+                        match cron_expr.parse::<croner::Cron>() {
                             Ok(cron) => CronSchedule::Cron(Box::new(cron)),
                             Err(e) => {
                                 error!(
