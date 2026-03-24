@@ -34,6 +34,7 @@ pub struct NetworkContract {
     pub start_block: Option<U64>,
     pub end_block: Option<U64>,
     pub disable_logs_bloom_checks: bool,
+    pub reorg_safe_distance: Option<ReorgSafeDistance>,
 }
 
 impl NetworkContract {
@@ -57,7 +58,6 @@ pub struct ContractInformation {
     pub name: String,
     pub details: Vec<NetworkContract>,
     pub abi: StringOrArray,
-    pub reorg_safe_distance: Option<ReorgSafeDistance>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -86,6 +86,13 @@ impl ContractInformation {
                 }
                 Some(provider) => {
                     let client = Arc::clone(&provider.client);
+                    let network_reorg = manifest
+                        .networks
+                        .iter()
+                        .find(|n| n.name == c.network)
+                        .and_then(|n| n.reorg_safe_distance);
+                    let reorg_safe_distance =
+                        contract.reorg_safe_distance.or(network_reorg);
                     details.push(NetworkContract {
                         id: generate_random_id(10),
                         network: c.network.clone(),
@@ -100,6 +107,7 @@ impl ContractInformation {
                         start_block: c.start_block,
                         end_block: c.end_block,
                         disable_logs_bloom_checks: provider.disable_logs_bloom_checks,
+                        reorg_safe_distance,
                     });
                 }
             }
@@ -109,7 +117,6 @@ impl ContractInformation {
             name: contract.name.clone(),
             details,
             abi: contract.abi.clone(),
-            reorg_safe_distance: contract.reorg_safe_distance,
         })
     }
 }
@@ -122,6 +129,7 @@ pub struct NetworkTrace {
     pub start_block: Option<U64>,
     pub end_block: Option<U64>,
     pub method: TraceProcessingMethod,
+    pub reorg_safe_distance: Option<ReorgSafeDistance>,
 }
 
 impl NetworkTrace {
@@ -138,13 +146,13 @@ impl NetworkTrace {
 pub struct TraceInformation {
     pub name: String,
     pub details: Vec<NetworkTrace>,
-    pub reorg_safe_distance: Option<ReorgSafeDistance>,
 }
 
 impl TraceInformation {
     pub fn create(
         native_transfers: NativeTransfers,
         network_providers: &[CreateNetworkProvider],
+        manifest: &Manifest,
     ) -> Result<TraceInformation, CreateContractInformationError> {
         let mut details = vec![];
         let trace_networks = native_transfers.networks.unwrap_or_default();
@@ -156,10 +164,17 @@ impl TraceInformation {
             match provider {
                 None => {
                     return Err(CreateContractInformationError::CanNotFindNetworkFromProviders(
-                        name,
+                        name.clone(),
                     ));
                 }
                 Some(provider) => {
+                    let network_reorg = manifest
+                        .networks
+                        .iter()
+                        .find(|net| net.name == name)
+                        .and_then(|net| net.reorg_safe_distance);
+                    let reorg_safe_distance =
+                        native_transfers.reorg_safe_distance.or(network_reorg);
                     details.push(NetworkTrace {
                         id: generate_random_id(10),
                         network: name,
@@ -167,6 +182,7 @@ impl TraceInformation {
                         start_block: n.start_block,
                         end_block: n.end_block,
                         method: n.method,
+                        reorg_safe_distance,
                     });
                 }
             }
@@ -175,7 +191,6 @@ impl TraceInformation {
         Ok(TraceInformation {
             name: EVENT_NAME.to_string(),
             details,
-            reorg_safe_distance: native_transfers.reorg_safe_distance,
         })
     }
 }

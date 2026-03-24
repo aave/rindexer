@@ -684,20 +684,22 @@ fn generate_trace_bindings_code(
                     name: event_name.to_string(),
                     details: contract_details
                         .iter()
-                        .map(|c| NetworkTrace {{
-                            id: generate_random_id(10),
-                            network: c.network.clone(),
-                            cached_provider: providers
-                                .get(&c.network)
-                                .expect("must have a provider")
-                                .clone(),
-                            start_block: c.start_block,
-                            end_block: c.end_block,
-                            method: c.method,
+                        .map(|c| {{
+                            let network_reorg = rindexer_yaml.networks.iter().find(|n| n.name == c.network).and_then(|n| n.reorg_safe_distance);
+                            NetworkTrace {{
+                                id: generate_random_id(10),
+                                network: c.network.clone(),
+                                cached_provider: providers
+                                    .get(&c.network)
+                                    .expect("must have a provider")
+                                    .clone(),
+                                start_block: c.start_block,
+                                end_block: c.end_block,
+                                method: c.method,
+                                reorg_safe_distance: rindexer_yaml.native_transfers.reorg_safe_distance.or(network_reorg),
+                            }}
                         }})
                         .collect(),
-                    reorg_safe_distance: rindexer_yaml
-                        .native_transfers.reorg_safe_distance,
                 }};
 
                 let callback: Arc<dyn Fn(Vec<TraceResult>) -> BoxFuture<'static, TraceCallbackResult<()>> + Send + Sync> = match self {{

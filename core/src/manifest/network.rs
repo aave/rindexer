@@ -10,6 +10,7 @@ use tokio::sync::broadcast::Sender;
 
 use tokio::time::sleep;
 
+use super::contract::ReorgSafeDistance;
 use super::core::{deserialize_option_u64_from_string, serialize_option_u64_as_string};
 #[cfg(feature = "reth")]
 use super::reth::RethConfig;
@@ -54,6 +55,9 @@ pub struct Network {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_logs_bloom_checks: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reorg_safe_distance: Option<ReorgSafeDistance>,
 
     /// Custom Multicall3 contract address for this network.
     /// If not specified, uses the standard address 0xcA11bde05977b3631167028862bE2a173976CA11.

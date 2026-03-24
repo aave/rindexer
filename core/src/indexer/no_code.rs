@@ -1064,7 +1064,7 @@ pub async fn process_trace_events(
             .clone();
 
         let trace_information =
-            TraceInformation::create(manifest.native_transfers.clone(), network_providers)?;
+            TraceInformation::create(manifest.native_transfers.clone(), network_providers, manifest)?;
 
         let mut csv: Option<Arc<AsyncCsvAppender>> = None;
         if contract.generate_csv.unwrap_or(true) && manifest.storage.csv_enabled() {

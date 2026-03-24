@@ -361,11 +361,11 @@ where
                             .iter()
                             .find(|n| n.name == c.network)
                             .map_or(false, |n| n.disable_logs_bloom_checks.unwrap_or_default()),
+                        reorg_safe_distance: contract_details.reorg_safe_distance.or_else(|| rindexer_yaml.networks.iter().find(|n| n.name == c.network).and_then(|n| n.reorg_safe_distance)),
                     }
                 })
                 .collect(),
             abi: contract_details.abi,
-            reorg_safe_distance: contract_details.reorg_safe_distance,
         };
 
         let callback: Arc<

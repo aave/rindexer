@@ -233,7 +233,7 @@ async fn start_indexing_traces(
             sync_config,
             &format!("TraceEvents[{}]", network_name),
             &network_name,
-            first_event.trace_information.reorg_safe_distance,
+            network_details.reorg_safe_distance,
         )
         .await?;
 
@@ -358,7 +358,7 @@ async fn start_indexing_contract_events(
                     config,
                     &event.info_log_name(),
                     &network_contract.network,
-                    event.contract.reorg_safe_distance,
+                    network_contract.reorg_safe_distance,
                 )
                 .await;
 
