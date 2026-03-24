@@ -1,8 +1,6 @@
 use deadpool::managed::PoolError;
 use deadpool_lapin::{lapin, Manager, Pool};
-use lapin::{
-    options::*, types::FieldTable, BasicProperties, ConnectionProperties,
-};
+use lapin::{options::*, types::FieldTable, BasicProperties, ConnectionProperties};
 use serde_json::Value;
 
 use crate::manifest::stream::ExchangeKindWrapper;
@@ -27,10 +25,7 @@ pub struct RabbitMQ {
 impl RabbitMQ {
     pub async fn new(uri: &str) -> Self {
         let manager = Manager::new(uri, ConnectionProperties::default());
-        let pool = Pool::builder(manager)
-            .max_size(16)
-            .build()
-            .expect("Failed to create pool");
+        let pool = Pool::builder(manager).max_size(16).build().expect("Failed to create pool");
 
         Self { pool }
     }
@@ -68,9 +63,7 @@ impl RabbitMQ {
                 exchange,
                 match &exchange_type.0 {
                     lapin::ExchangeKind::Fanout => "", // Fanout exchange ignores the routing key
-                    _ => routing_key
-                        .as_ref()
-                        .expect("Routing key should be defined"),
+                    _ => routing_key.as_ref().expect("Routing key should be defined"),
                 },
                 BasicPublishOptions::default(),
                 &message_body,

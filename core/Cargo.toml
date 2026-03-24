@@ -83,7 +83,7 @@ anyhow = "1.0.102"
 winnow = "0.7.13"
 tower = "0.5.3"
 axum = "0.8"
-prometheus = "0.14"
+prometheus = { version = "0.14", default-features = false } # disable protobuf
 
 # build
 jemallocator = { version = "0.6.1", package = "tikv-jemallocator", optional = true }
