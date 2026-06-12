@@ -1,0 +1,22 @@
+core/src/indexer/last_synced.rs
+  s_125e2398024efc::t_bde24002ddcaf1 319-327,329,332-337
+core/src/indexer/fetch_logs.rs
+  s_125e2398024efc::t_d0c8b704af0db1 1288-1296
+  s_125e2398024efc::t_f60ece6d6f3829 1402-1404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "756be7326127e39f3af203fc2aefdb1bac1d114b",
+  "prompts": {},
+  "sessions": {
+    "s_125e2398024efc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b153661-a340-4ea2-9981-21459cacbfd6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jaggad <jack@turboclicks.com.au>"
+    }
+  }
+}
