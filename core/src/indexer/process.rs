@@ -668,7 +668,17 @@ async fn live_indexing_for_contract_event_dependencies(
                 }
             }
 
-            let to_block = safe_block_number;
+            // Cap the live range to the provider's max_block_range. An event that has fallen far
+            // behind head (RPC hiccup, restart gap) would otherwise issue one get_logs over
+            // [from_block, safe_head]; against an RPC that caps the range that request fails and the
+            // event never advances. Chunking lets it converge one window at a time, the same way
+            // the historical path does.
+            let to_block = match cached_provider.max_block_range() {
+                Some(max_range) if !max_range.is_zero() => {
+                    from_block.saturating_add(max_range - U64::from(1)).min(safe_block_number)
+                }
+                _ => safe_block_number,
+            };
             // The bloom-filter shortcut only applies when the single block
             // we're about to fetch IS `latest_block`. With
             // `reorg_safe_distance > 0` the processed block lags behind the
