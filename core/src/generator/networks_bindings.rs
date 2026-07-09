@@ -63,7 +63,7 @@ fn generate_network_lazy_provider_code(network: &Network) -> Code {
         {network_name}
             .get_or_init(|| async {{
                 {reth_init_fn}
-                {client_fn}(&public_read_env_value("{network_url}").unwrap_or("{network_url}".to_string()), {chain_id}, {compute_units_per_second}, {max_block_range}, {block_poll_frq} {placeholder_headers}, {get_logs_settings}, {chain_state_notification})
+                {client_fn}(&public_read_env_value("{network_url}").unwrap_or("{network_url}".to_string()), {fallback_rpcs}{chain_id}, {compute_units_per_second}, {max_block_range}, {block_poll_frq} {placeholder_headers}, {get_logs_settings}, {chain_state_notification})
                 .await
                 .expect("Error creating provider")
             }})
@@ -93,6 +93,19 @@ fn generate_network_lazy_provider_code(network: &Network) -> Code {
             format!("Some(AddressFiltering::{:?})", settings.address_filtering)
         } else {
             "None".to_string()
+        },
+        // The shadow client keeps its own (fallback-less) signature; every other network passes
+        // its fallback endpoints (env-substituted, same as the primary) as the second arg.
+        fallback_rpcs = if network.rpc.contains("shadow") {
+            String::new()
+        } else {
+            let items = network
+                .fallback_rpcs
+                .iter()
+                .map(|u| format!("public_read_env_value(\"{u}\").unwrap_or(\"{u}\".to_string())"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("&[{items}], ")
         },
         client_fn =
             if network.rpc.contains("shadow") { "create_shadow_client" } else { "create_client" },
@@ -178,7 +191,7 @@ pub fn generate_networks_code(networks: &[Network]) -> Code {
             "X-SHADOW-API-KEY",
             public_read_env_value("RINDEXER_PHANTOM_API_KEY").unwrap().parse().unwrap(),
         );
-        create_client(rpc_url, chain_id, compute_units_per_second, max_block_range, block_poll_frequency, header, address_filtering, chain_state_notification).await
+        create_client(rpc_url, &[], chain_id, compute_units_per_second, max_block_range, block_poll_frequency, header, address_filtering, chain_state_notification).await
     }
         "#
         .to_string(),
@@ -211,6 +224,7 @@ mod tests {
             name: name.to_string(),
             chain_id,
             rpc: format!("https://{name}.example.com"),
+            fallback_rpcs: vec![],
             block_poll_frequency: None,
             compute_units_per_second: None,
             max_block_range: None,
