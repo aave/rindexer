@@ -34,6 +34,7 @@ async fn create_shadow_client(
     );
     create_client(
         rpc_url,
+        &[],
         chain_id,
         compute_units_per_second,
         max_block_range,
@@ -55,6 +56,7 @@ pub async fn get_ethereum_provider_cache() -> Arc<JsonRpcCachedProvider> {
             create_client(
                 &public_read_env_value("https://mainnet.gateway.tenderly.co")
                     .unwrap_or("https://mainnet.gateway.tenderly.co".to_string()),
+                &[],
                 1,
                 None,
                 None,

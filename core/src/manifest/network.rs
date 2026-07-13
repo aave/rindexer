@@ -46,6 +46,14 @@ pub struct Network {
 
     pub rpc: String,
 
+    /// Optional secondary RPC endpoints used as failover for `rpc`. When set, all endpoints
+    /// (`rpc` first, then these) are wrapped in an alloy `FallbackLayer`: requests use the
+    /// best-scoring healthy endpoint and automatically fail over when it errors or degrades.
+    /// When empty/omitted, only `rpc` is used and behaviour is unchanged. All endpoints must
+    /// serve the same `chain_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_rpcs: Vec<String>,
+
     /// Poll the latest block at a defined frequency. It is recommended that this frequency be a
     /// multiple faster than the networks block time to ensure fast indexing.
     ///

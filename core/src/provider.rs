@@ -26,7 +26,7 @@ use alloy::{
             reqwest::{header::HeaderMap, Client, Error as ReqwestError},
             Http,
         },
-        layers::RetryBackoffLayer,
+        layers::{FallbackLayer, RetryBackoffLayer},
         RpcError, TransportErrorKind,
     },
 };
@@ -37,6 +37,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::future::IntoFuture;
+use std::num::NonZeroUsize;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -44,7 +45,8 @@ use std::{
 use thiserror::Error;
 use tokio::sync::{broadcast::Sender, Mutex, Semaphore};
 use tokio::task::JoinError;
-use tracing::{debug, debug_span, error, Instrument};
+use tower::Layer;
+use tracing::{debug, debug_span, error, warn, Instrument};
 use url::Url;
 
 use async_trait::async_trait;
@@ -1132,6 +1134,7 @@ const MAX_RPC_RATE_LIMIT_RETRIES: u32 = 10;
 #[allow(clippy::too_many_arguments)]
 pub async fn create_client(
     rpc_url: &str,
+    fallback_rpcs: &[String],
     chain_id: u64,
     compute_units_per_second: Option<u64>,
     max_block_range: Option<U64>,
@@ -1143,6 +1146,12 @@ pub async fn create_client(
     let chain = Chain::from(chain_id);
 
     let (client, provider) = if rpc_url.ends_with(".ipc") {
+        if !fallback_rpcs.is_empty() {
+            warn!(
+                "fallback_rpcs are ignored for the IPC endpoint {} (chain {})",
+                rpc_url, chain_id
+            );
+        }
         let ipc = IpcConnect::new(rpc_url.to_string());
         let retry_layer = RetryBackoffLayer::new(
             MAX_RPC_RATE_LIMIT_RETRIES,
@@ -1164,7 +1173,7 @@ pub async fn create_client(
 
         (rpc_client, provider)
     } else {
-        let rpc_url = Url::parse(rpc_url).map_err(|e| {
+        let primary_url = Url::parse(rpc_url).map_err(|e| {
             RetryClientError::ProviderCantBeCreated(rpc_url.to_string(), e.to_string())
         })?;
 
@@ -1173,15 +1182,47 @@ pub async fn create_client(
             .timeout(Duration::from_secs(90))
             .build()?;
 
+        // Label metrics/logs with the primary URL. Metrics are keyed by network+method (not
+        // per-URL), and the logging layer wraps the fallback service, so it records the net
+        // outcome after any failover — correct for backoff/rate-limit accounting.
         let logging_layer = RpcLoggingLayer::new(chain_id, rpc_url.to_string());
-        let http = Http::with_client(client_with_auth, rpc_url);
         let retry_layer = RetryBackoffLayer::new(
             MAX_RPC_RATE_LIMIT_RETRIES,
             1000,
             compute_units_per_second.unwrap_or(660),
         );
-        let rpc_client =
-            RpcClient::builder().layer(retry_layer).layer(logging_layer).transport(http, false);
+
+        let primary_http = Http::with_client(client_with_auth.clone(), primary_url);
+
+        let rpc_client = if fallback_rpcs.is_empty() {
+            // No fallbacks: single transport, identical to the previous behaviour.
+            RpcClient::builder()
+                .layer(retry_layer)
+                .layer(logging_layer)
+                .transport(primary_http, false)
+        } else {
+            // Primary first, then each fallback, all wrapped in a FallbackLayer. With an active
+            // transport count of 1 the client uses the best-scoring healthy endpoint and fails
+            // over to the next when it errors/degrades (~1x request cost, no parallel racing).
+            let mut transports = Vec::with_capacity(1 + fallback_rpcs.len());
+            transports.push(primary_http);
+            for raw in fallback_rpcs {
+                let url = Url::parse(raw).map_err(|e| {
+                    RetryClientError::ProviderCantBeCreated(raw.clone(), e.to_string())
+                })?;
+                transports.push(Http::with_client(client_with_auth.clone(), url));
+            }
+
+            let fallback_service = FallbackLayer::default()
+                .with_active_transport_count(NonZeroUsize::new(1).expect("1 is non-zero"))
+                .layer(transports);
+
+            RpcClient::builder()
+                .layer(retry_layer)
+                .layer(logging_layer)
+                .transport(fallback_service, false)
+        };
+
         let provider =
             ProviderBuilder::new().network::<AnyNetwork>().connect_client(rpc_client.clone());
 
@@ -1272,6 +1313,7 @@ impl CreateNetworkProvider {
             // create the provider
             let provider = create_client(
                 &provider_url,
+                &network.fallback_rpcs,
                 network.chain_id,
                 network.compute_units_per_second,
                 network.max_block_range,

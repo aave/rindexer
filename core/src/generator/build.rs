@@ -642,6 +642,7 @@ mod tests {
             name: "ethereum".to_string(),
             chain_id: 1,
             rpc: "https://eth.example.com".to_string(),
+            fallback_rpcs: vec![],
             block_poll_frequency: None,
             compute_units_per_second: None,
             max_block_range: None,
