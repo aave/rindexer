@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::{any::Any, sync::Arc, time::Duration};
 use tokio::sync::broadcast::Sender;
 use tokio::time::sleep;
@@ -520,6 +521,20 @@ async fn fire_on_reorg_isolated(
     }
 }
 
+// Max attempts before `trigger_event` gives up on an event and returns Err instead of retrying
+// forever. 0 (the default) keeps the original retry-forever behaviour, so this is opt-in and can't
+// regress existing setups. Set RINDEXER_MAX_EVENT_RETRIES to bound a poisoned event that would
+// otherwise wedge the stream indefinitely.
+fn max_event_retries() -> u32 {
+    static MAX: OnceLock<u32> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("RINDEXER_MAX_EVENT_RETRIES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
 async fn trigger_event<T>(
     id: &String,
     data: Vec<T>,
@@ -532,6 +547,7 @@ where
 {
     let mut attempts = 0;
     let mut delay = Duration::from_millis(100);
+    let max_retries = max_event_retries();
 
     let len = data.len();
     debug!("{} - Pushed {} events", len, info_log_name());
@@ -560,6 +576,14 @@ where
                     "{} Event processing failed - id: {} - topic_id: {}. Retrying... (attempt {}). Error: {}",
                     info_log_name(), id, event_identifier, attempts, e
                 );
+
+                if max_retries != 0 && attempts >= max_retries {
+                    error!(
+                        "{} Event processing gave up after {} attempts - id: {} - topic_id: {}. Last error: {}",
+                        info_log_name(), attempts, id, event_identifier, e
+                    );
+                    return Err(e);
+                }
 
                 delay = (delay * 2).min(Duration::from_secs(15));
 

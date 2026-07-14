@@ -3,6 +3,7 @@ use alloy::primitives::{B256, U64};
 use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use futures::{poll, FutureExt, StreamExt};
+use once_cell::sync::Lazy;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio::{
@@ -668,7 +669,17 @@ async fn live_indexing_for_contract_event_dependencies(
                 }
             }
 
-            let to_block = safe_block_number;
+            // Cap the live range to the provider's max_block_range. An event that has fallen far
+            // behind head (RPC hiccup, restart gap) would otherwise issue one get_logs over
+            // [from_block, safe_head]; against an RPC that caps the range that request fails and the
+            // event never advances. Chunking lets it converge one window at a time, the same way
+            // the historical path does.
+            let to_block = match cached_provider.max_block_range() {
+                Some(max_range) if !max_range.is_zero() => {
+                    from_block.saturating_add(max_range - U64::from(1)).min(safe_block_number)
+                }
+                _ => safe_block_number,
+            };
             // The bloom-filter shortcut only applies when the single block
             // we're about to fetch IS `latest_block`. With
             // `reorg_safe_distance > 0` the processed block lags behind the
@@ -838,9 +849,36 @@ async fn live_indexing_for_contract_event_dependencies(
     }
 }
 
+/// Tracks, per event processor, the first block of a batch that exhausted its retries and gave
+/// up (only relevant when `RINDEXER_MAX_EVENT_RETRIES` is set). Persisted progress must never
+/// advance to or past this block: otherwise a later successful range would push
+/// `last_synced_block` beyond the un-committed window and silently skip it. In-memory only —
+/// cleared on restart, at which point indexing resumes from the last committed block and replays
+/// the gap in dependency order.
+static GIVE_UP_FLOOR: Lazy<std::sync::Mutex<HashMap<String, U64>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Record (or lower) the give-up floor for a processor.
+fn record_give_up_floor(id: &str, from_block: U64) {
+    let mut map = GIVE_UP_FLOOR.lock().expect("give-up floor mutex poisoned");
+    map.entry(id.to_string())
+        .and_modify(|b| {
+            if from_block < *b {
+                *b = from_block;
+            }
+        })
+        .or_insert(from_block);
+}
+
+/// Lowest block a batch gave up on for this processor, if any.
+fn give_up_floor(id: &str) -> Option<U64> {
+    GIVE_UP_FLOOR.lock().expect("give-up floor mutex poisoned").get(id).copied()
+}
+
 async fn trigger_event(
     config: Arc<EventProcessingConfig>,
     fn_data: Vec<EventResult>,
+    from_block: U64,
     to_block: U64,
 ) {
     indexing_event_processing();
@@ -870,10 +908,37 @@ async fn trigger_event(
     };
 
     if should_update_progress {
+        // Guard: never advance persisted progress to/past a range an earlier batch gave up on.
+        // Without this, the DB update (which is monotonic-forward) would let this later success
+        // push `last_synced_block` beyond the un-committed window, silently skipping it.
+        if let Some(floor) = give_up_floor(&config.id()) {
+            if to_block >= floor {
+                warn!(
+                    "{} - progress pinned below block {} - an earlier batch exhausted its retries; not advancing last_synced_block past the un-committed range (restart to replay it)",
+                    config.info_log_name(),
+                    floor
+                );
+                indexing_event_processed();
+                return;
+            }
+        }
+
         // TODO: There is a double-index race condition here. If we get a crash or failure between
         //       triggering the event and syncing the last updated block, we may double index.
         update_progress_and_last_synced_task(config, to_block, indexing_event_processed).await;
     } else {
+        // A non-empty batch that gave up while still running (i.e. exhausted RINDEXER_MAX_EVENT_RETRIES,
+        // not a shutdown) records a floor so subsequent successful ranges can't skip past it.
+        if !fn_data.is_empty() && is_running() && !config.cancel_token().is_cancelled() {
+            record_give_up_floor(&config.id(), from_block);
+            warn!(
+                "{} - batch {} - {} exhausted its retries; pinning progress below block {} so it isn't silently skipped",
+                config.info_log_name(),
+                from_block,
+                to_block,
+                from_block
+            );
+        }
         indexing_event_processed();
     }
 }
@@ -908,13 +973,13 @@ async fn handle_logs_result(
 
             if let Ok(permit) = callback_permits.clone().acquire_owned().await {
                 let task = tokio::spawn(async move {
-                    trigger_event(config, fn_data, result.to_block).await;
+                    trigger_event(config, fn_data, result.from_block, result.to_block).await;
                     drop(permit)
                 });
 
                 Ok(task)
             } else {
-                trigger_event(config, fn_data, result.to_block).await;
+                trigger_event(config, fn_data, result.from_block, result.to_block).await;
                 Ok(tokio::spawn(async {}))
             }
         }
@@ -1073,5 +1138,55 @@ mod tests {
         for expected in (0..5).chain([100, 101]).chain(200..205) {
             assert!(seen.contains(&expected), "missing dispatch for tag {expected}: {completed:?}");
         }
+    }
+
+    // --- give-up floor guard (RINDEXER_MAX_EVENT_RETRIES safety net) ---
+    //
+    // GIVE_UP_FLOOR is a process-global map, so every test below uses a unique
+    // processor id to stay isolated from the others running in parallel.
+
+    #[test]
+    fn give_up_floor_unset_is_none() {
+        assert_eq!(give_up_floor("test-floor-unset"), None);
+    }
+
+    #[test]
+    fn record_give_up_floor_sets_initial_value() {
+        let id = "test-floor-initial";
+        record_give_up_floor(id, U64::from(500));
+        assert_eq!(give_up_floor(id), Some(U64::from(500)));
+    }
+
+    #[test]
+    fn record_give_up_floor_lowers_but_never_raises() {
+        let id = "test-floor-monotonic";
+        record_give_up_floor(id, U64::from(100));
+        assert_eq!(give_up_floor(id), Some(U64::from(100)));
+
+        // A give-up on an earlier block lowers the floor.
+        record_give_up_floor(id, U64::from(50));
+        assert_eq!(give_up_floor(id), Some(U64::from(50)));
+
+        // A give-up on a later block must not raise it — the earliest
+        // un-committed block is the one progress must never pass.
+        record_give_up_floor(id, U64::from(200));
+        assert_eq!(give_up_floor(id), Some(U64::from(50)), "floor must track the earliest give-up");
+    }
+
+    #[test]
+    fn floor_guard_pins_at_or_past_floor_and_allows_below() {
+        let id = "test-floor-boundary";
+        record_give_up_floor(id, U64::from(100));
+
+        // Mirrors the check in `trigger_event`: progress may advance only when
+        // the batch's `to_block` is strictly below the floor.
+        let may_advance = |to_block: U64| match give_up_floor(id) {
+            Some(floor) => to_block < floor,
+            None => true,
+        };
+
+        assert!(may_advance(U64::from(99)), "range ending below the floor should still commit");
+        assert!(!may_advance(U64::from(100)), "range ending at the floor must be pinned");
+        assert!(!may_advance(U64::from(101)), "range ending past the floor must be pinned");
     }
 }
