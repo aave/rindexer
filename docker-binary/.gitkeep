@@ -1,0 +1,3 @@
+# Placeholder so `COPY docker-binary/` in the Dockerfile always has a directory to
+# copy. CI drops the natively-built `rindexer_cli` binary here; a local `docker build`
+# leaves it empty and the Dockerfile falls back to building from source.

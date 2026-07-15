@@ -21,22 +21,45 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  build:
-    name: Build & publish Docker image
-    runs-on: ubuntu-latest
+  build-amd64:
+    name: Build AMD64 Docker Image
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
 
-      # Login against a Docker registry
-      # https://github.com/docker/login-action
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-docker
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libssl-dev clang libclang-dev cmake
+
+      - name: Build Rust binary
+        env:
+          RUSTFLAGS: '-C target-cpu=x86-64-v2'
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p rindexer_cli --features jemalloc
+
+      - name: Prepare binary for Docker
+        run: |
+          mkdir -p docker-binary
+          cp target/x86_64-unknown-linux-gnu/release/rindexer_cli docker-binary/rindexer_cli
+          chmod +x docker-binary/rindexer_cli
+
+      - uses: docker/setup-buildx-action@v3
+
       - name: Log into registry ${{ env.REGISTRY }}
         uses: docker/login-action@v3
         with:
@@ -44,8 +67,105 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Resolve the release version from (in priority order): an explicit workflow
-      # input, or the published release's tag. Empty => an unversioned "edge" build.
+      - name: Generate tag
+        id: tags
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=${{ env.IMAGE }}:sha-${SHORT_SHA}-amd64" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push AMD64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tag }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=docker-amd64
+          cache-to: type=gha,mode=max,scope=docker-amd64
+
+  build-arm64:
+    name: Build ARM64 Docker Image
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-unknown-linux-gnu-docker
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libssl-dev clang libclang-dev cmake
+
+      - name: Build Rust binary
+        env:
+          RUSTFLAGS: '-C target-cpu=neoverse-n1'
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p rindexer_cli
+
+      - name: Prepare binary for Docker
+        run: |
+          mkdir -p docker-binary
+          cp target/aarch64-unknown-linux-gnu/release/rindexer_cli docker-binary/rindexer_cli
+          chmod +x docker-binary/rindexer_cli
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate tag
+        id: tags
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=${{ env.IMAGE }}:sha-${SHORT_SHA}-arm64" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ARM64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tag }}
+          platforms: linux/arm64
+          cache-from: type=gha,scope=docker-arm64
+          cache-to: type=gha,mode=max,scope=docker-arm64
+
+  create-manifest:
+    name: Create Multi-Arch Manifest
+    runs-on: ubuntu-24.04
+    needs: [ build-amd64, build-arm64 ]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolve the release version from an explicit input, or the published
+      # release's tag. Empty => an unversioned "edge" build.
       - name: Determine version
         id: version
         run: |
@@ -56,35 +176,26 @@ jobs:
           else
             VERSION=""
           fi
-          # Normalise a leading "v" (v0.41.1 -> 0.41.1) so image tags are clean.
-          VERSION="${VERSION#v}"
+          VERSION="${VERSION#v}"   # normalise leading "v" (v0.41.1 -> 0.41.1)
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      # Build the tag list. A versioned build (release or explicit input) gets the
-      # version tag AND :latest; everything else gets :edge. Every build is also
-      # pinned to its commit via :sha-<short>.
-      - name: Compute image tags
-        id: tags
+      # Stitch the per-arch images into one multi-platform manifest per tag.
+      # A versioned build gets :<version> and :latest; otherwise :edge. Every
+      # build also gets an immutable multi-arch :sha-<short> for pinning.
+      - name: Create and push multi-arch manifests
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          AMD64="${{ env.IMAGE }}:sha-${SHORT_SHA}-amd64"
+          ARM64="${{ env.IMAGE }}:sha-${SHORT_SHA}-arm64"
           VERSION="${{ steps.version.outputs.version }}"
-          TAGS="${{ env.IMAGE }}:sha-${SHORT_SHA}"
-          if [ -n "$VERSION" ]; then
-            TAGS="${TAGS},${{ env.IMAGE }}:${VERSION},${{ env.IMAGE }}:latest"
-          else
-            TAGS="${TAGS},${{ env.IMAGE }}:edge"
-          fi
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echo "Resolved tags: ${TAGS}"
 
-      # Build and push Docker image with Buildx
-      # https://github.com/docker/build-push-action
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          docker buildx imagetools create -t "${{ env.IMAGE }}:sha-${SHORT_SHA}" "$AMD64" "$ARM64"
+
+          if [ -n "$VERSION" ]; then
+            docker buildx imagetools create -t "${{ env.IMAGE }}:${VERSION}" "$AMD64" "$ARM64"
+            docker buildx imagetools create -t "${{ env.IMAGE }}:latest" "$AMD64" "$ARM64"
+          else
+            docker buildx imagetools create -t "${{ env.IMAGE }}:edge" "$AMD64" "$ARM64"
+          fi
+
+          echo "Published multi-arch manifest for sha-${SHORT_SHA}${VERSION:+, ${VERSION}, latest}"
