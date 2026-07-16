@@ -36,7 +36,10 @@ RUN if [ -f /tmp/docker-binary/rindexer_cli ]; then \
         fi; \
     fi
 
-FROM debian:bookworm-slim
+# trixie (glibc 2.41) — must be >= the glibc the binary was linked against. CI builds the
+# binary natively on ubuntu-24.04 (glibc 2.39); bookworm-slim (2.36) is too old and the
+# binary fails to load with "GLIBC_2.39 not found".
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
