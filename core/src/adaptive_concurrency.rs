@@ -24,6 +24,8 @@ static CONTROLLER_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
 /// Adaptive concurrency controller that scales based on success/failure rates.
 /// Scales up when requests succeed, scales down when rate limits are hit.
 pub struct AdaptiveConcurrency {
+    /// Network name used as the `network` label on the adaptive metrics.
+    network: String,
     current: AtomicUsize,
     min: usize,
     max: usize,
@@ -59,8 +61,9 @@ pub struct AdaptiveConcurrency {
 }
 
 impl AdaptiveConcurrency {
-    pub fn new(initial: usize, min: usize, max: usize) -> Self {
+    pub fn new(network: impl Into<String>, initial: usize, min: usize, max: usize) -> Self {
         Self {
+            network: network.into(),
             current: AtomicUsize::new(initial),
             min,
             max,
@@ -118,11 +121,15 @@ impl AdaptiveConcurrency {
     /// state transition so alerts see backoff/scale-down in near real time.
     fn publish_metrics(&self) {
         rpc_metrics::set_adaptive_state(
+            &self.network,
             self.current.load(Ordering::Relaxed),
             self.batch_size.load(Ordering::Relaxed),
             self.backoff_ms.load(Ordering::Relaxed),
         );
-        rpc_metrics::set_rate_limit_events(self.rate_limit_count.load(Ordering::Relaxed));
+        rpc_metrics::set_rate_limit_events(
+            &self.network,
+            self.rate_limit_count.load(Ordering::Relaxed),
+        );
     }
 
     /// Wait for the backoff delay if one is active.
@@ -417,9 +424,10 @@ pub fn is_rate_limited_or_unavailable(error_message: &str) -> bool {
 /// shared state the RPC layer signals from.
 pub static ADAPTIVE_CONCURRENCY: Lazy<Arc<AdaptiveConcurrency>> = Lazy::new(|| {
     Arc::new(AdaptiveConcurrency::new(
-        20,  // Start with 20 concurrent batches
-        2,   // Minimum 2
-        200, // Maximum 200
+        "global", // Metric label; replaced by per-network controllers.
+        20,       // Start with 20 concurrent batches
+        2,        // Minimum 2
+        200,      // Maximum 200
     ))
 });
 
@@ -431,7 +439,7 @@ mod tests {
     /// read once the (backoff-scaled) idle window has been faked past via
     /// [`advance_clock`] — tests need no wall-clock sleeps.
     fn instant_recovery_controller() -> AdaptiveConcurrency {
-        let mut c = AdaptiveConcurrency::new(20, 2, 200);
+        let mut c = AdaptiveConcurrency::new("testnet", 20, 2, 200);
         c.idle_before_recovery_ms = 0;
         c.recovery_interval_ms = 0;
         c
@@ -447,7 +455,7 @@ mod tests {
 
     #[test]
     fn record_rate_limit_grows_backoff_and_scales_down() {
-        let c = AdaptiveConcurrency::new(20, 2, 200);
+        let c = AdaptiveConcurrency::new("testnet", 20, 2, 200);
         c.record_rate_limit();
         assert_eq!(backoff(&c), 500, "first rate limit starts backoff at 500ms");
         c.record_rate_limit();
@@ -495,7 +503,7 @@ mod tests {
     #[test]
     fn recovery_holds_off_while_rate_limits_continue() {
         // Default 5s idle window: a just-recorded rate limit must not be undone immediately.
-        let c = AdaptiveConcurrency::new(20, 2, 200);
+        let c = AdaptiveConcurrency::new("testnet", 20, 2, 200);
         c.record_rate_limit();
         let after_limit = backoff(&c);
         // current_backoff_ms() runs recovery, but the idle window hasn't elapsed.
@@ -510,7 +518,7 @@ mod tests {
     fn required_idle_window_scales_with_backoff() {
         // With a large backoff all workers are asleep, so a short quiet period
         // proves nothing: the idle requirement is max(5s, 2 × backoff).
-        let c = AdaptiveConcurrency::new(20, 2, 200);
+        let c = AdaptiveConcurrency::new("testnet", 20, 2, 200);
         for _ in 0..7 {
             c.record_rate_limit();
         }
@@ -532,7 +540,7 @@ mod tests {
 
     #[test]
     fn rpc_layer_success_decays_backoff_without_scaling_up() {
-        let c = AdaptiveConcurrency::new(20, 2, 200);
+        let c = AdaptiveConcurrency::new("testnet", 20, 2, 200);
         c.record_rate_limit();
         c.record_rate_limit();
         assert_eq!(backoff(&c), 1000);
@@ -554,8 +562,8 @@ mod tests {
     fn controllers_are_independent() {
         // The production incident: one network's rate limits must not throttle another's
         // controller.
-        let ethereum = AdaptiveConcurrency::new(20, 2, 200);
-        let avalanche = AdaptiveConcurrency::new(20, 2, 200);
+        let ethereum = AdaptiveConcurrency::new("ethereum", 20, 2, 200);
+        let avalanche = AdaptiveConcurrency::new("avalanche", 20, 2, 200);
 
         for _ in 0..5 {
             ethereum.record_rate_limit();
