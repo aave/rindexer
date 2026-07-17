@@ -153,7 +153,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::adaptive_concurrency::{is_rate_limited_or_unavailable, ADAPTIVE_CONCURRENCY};
+use crate::adaptive_concurrency::is_rate_limited_or_unavailable;
 use crate::database::batch_operations::{
     BatchOperationAction, BatchOperationColumnBehavior, BatchOperationSqlType, BatchOperationType,
     DynamicColumnDefinition,
@@ -375,7 +375,7 @@ pub async fn configure_view_call_limit(limit: usize) {
 /// See: https://www.multicall3.com/deployments
 const DEFAULT_MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
-// Note: Batch size is now adaptive (5-100) via ADAPTIVE_CONCURRENCY.current_batch_size()
+// Note: Batch size is adaptive (5-100) via each provider's adaptive controller.
 // It starts at 50 and scales down to 5 on rate limits, back up to 100 on consecutive successes.
 
 /// Networks where Multicall3 is known to not be available.
@@ -622,14 +622,10 @@ async fn prefetch_view_calls(
     // Execute batches in parallel with adaptive concurrency
     let mut batch_futures = Vec::new();
 
-    // Create a shared semaphore based on initial adaptive limit
-    let initial_limit = ADAPTIVE_CONCURRENCY.current();
-    let initial_batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
-    let adaptive_semaphore = Arc::new(tokio::sync::Semaphore::new(initial_limit));
-    info!(
-        "Starting $call resolution: {} concurrent batches, {} calls/batch (adaptive)",
-        initial_limit, initial_batch_size
-    );
+    // One semaphore per network, sized by that network's adaptive limit, so a
+    // throttled network can't starve the others.
+    let mut network_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
+    info!("Starting $call resolution (adaptive per-network concurrency)");
 
     for ((network, block_number), calls) in grouped {
         if networks_without_multicall.contains(&network) {
@@ -648,20 +644,26 @@ async fn prefetch_view_calls(
         let events_at_block = *events_per_block.get(&(network.clone(), block_number)).unwrap_or(&0);
         let processed_counter = processed_per_network.get(&network).cloned();
 
-        // Use adaptive batch size
-        let batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
+        let network_semaphore =
+            Arc::clone(network_semaphores.entry(network.clone()).or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(provider.adaptive_controller().current()))
+            }));
+
+        // Use this network's adaptive batch size
+        let batch_size = provider.adaptive_controller().current_batch_size();
         for chunk in calls.chunks(batch_size) {
             let chunk_vec: Vec<PendingViewCall> = chunk.to_vec();
             let network_clone = network.clone();
             let provider_clone = Arc::clone(&provider);
-            let semaphore = adaptive_semaphore.clone();
+            let semaphore = Arc::clone(&network_semaphore);
             let counter = processed_counter.clone();
             let block_num = block_number;
 
             batch_futures.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.ok()?;
+                let controller = provider_clone.adaptive_controller();
                 // Wait for backoff if rate limited (for free nodes)
-                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                controller.wait_for_backoff().await;
                 let result = execute_multicall3_batch(
                     &provider_clone,
                     &network_clone,
@@ -674,13 +676,13 @@ async fn prefetch_view_calls(
                 // Report to adaptive concurrency controller
                 match &result {
                     Ok(_) => {
-                        ADAPTIVE_CONCURRENCY.record_success();
+                        controller.record_success();
                     }
                     Err(e) => {
                         if is_rate_limited_or_unavailable(&e.to_string()) {
-                            ADAPTIVE_CONCURRENCY.record_rate_limit();
+                            controller.record_rate_limit();
                         } else {
-                            ADAPTIVE_CONCURRENCY.record_error();
+                            controller.record_error();
                         }
                     }
                 }
@@ -842,8 +844,9 @@ async fn prefetch_static_calls_via_multicall(
 
     let mut batch_futures = Vec::new();
 
-    // Create a shared semaphore based on adaptive limit
-    let adaptive_semaphore = Arc::new(tokio::sync::Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
+    // One semaphore per network, sized by that network's adaptive limit, so a
+    // throttled network can't starve the others.
+    let mut network_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
 
     for (network, calls) in grouped {
         if networks_without_multicall.contains(&network) {
@@ -859,18 +862,24 @@ async fn prefetch_static_calls_via_multicall(
             None => continue,
         };
 
-        // Batch ALL calls for this network together (using adaptive batch size)
-        let batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
+        let network_semaphore =
+            Arc::clone(network_semaphores.entry(network.clone()).or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(provider.adaptive_controller().current()))
+            }));
+
+        // Batch ALL calls for this network together (using this network's adaptive batch size)
+        let batch_size = provider.adaptive_controller().current_batch_size();
         for chunk in calls.chunks(batch_size) {
             let chunk_vec: Vec<PendingViewCall> = chunk.to_vec();
             let network_clone = network.clone();
             let provider_clone = Arc::clone(&provider);
-            let semaphore = adaptive_semaphore.clone();
+            let semaphore = Arc::clone(&network_semaphore);
 
             batch_futures.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.ok()?;
+                let controller = provider_clone.adaptive_controller();
                 // Wait for backoff if rate limited (for free nodes)
-                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                controller.wait_for_backoff().await;
                 let result = execute_static_multicall3_batch(
                     &provider_clone,
                     &network_clone,
@@ -882,13 +891,13 @@ async fn prefetch_static_calls_via_multicall(
                 // Report to adaptive concurrency controller
                 match &result {
                     Ok(_) => {
-                        ADAPTIVE_CONCURRENCY.record_success();
+                        controller.record_success();
                     }
                     Err(e) => {
                         if is_rate_limited_or_unavailable(&e.to_string()) {
-                            ADAPTIVE_CONCURRENCY.record_rate_limit();
+                            controller.record_rate_limit();
                         } else {
-                            ADAPTIVE_CONCURRENCY.record_error();
+                            controller.record_error();
                         }
                     }
                 }
@@ -1279,8 +1288,9 @@ async fn prefetch_block_timestamps(
     // Spawn tasks for parallel fetching with adaptive concurrency
     let mut handles = Vec::new();
 
-    // Create adaptive semaphore based on current concurrency level
-    let adaptive_semaphore = Arc::new(tokio::sync::Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
+    // One semaphore per network, sized by that network's adaptive limit, so a
+    // throttled network can't starve the others.
+    let mut network_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
 
     for (network, block_numbers) in blocks_to_fetch {
         if block_numbers.is_empty() {
@@ -1292,19 +1302,25 @@ async fn prefetch_block_timestamps(
             continue;
         };
 
-        // Split into batches using adaptive batch size
-        let batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
+        let network_semaphore =
+            Arc::clone(network_semaphores.entry(network.clone()).or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(provider.adaptive_controller().current()))
+            }));
+
+        // Split into batches using this network's adaptive batch size
+        let batch_size = provider.adaptive_controller().current_batch_size();
         for chunk in block_numbers.chunks(batch_size) {
             let network_clone = network.clone();
             let provider_clone = Arc::clone(&provider);
             let block_numbers_u64: Vec<U64> = chunk.iter().map(|&n| U64::from(n)).collect();
-            let semaphore = adaptive_semaphore.clone();
+            let semaphore = Arc::clone(&network_semaphore);
 
             let rpc_batch_size = batch_size;
             handles.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.ok()?;
+                let controller = provider_clone.adaptive_controller();
                 // Wait for backoff if rate limited (for free nodes)
-                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                controller.wait_for_backoff().await;
 
                 match provider_clone
                     .get_block_by_number_batch_with_size(
@@ -1315,14 +1331,14 @@ async fn prefetch_block_timestamps(
                     .await
                 {
                     Ok(blocks) => {
-                        ADAPTIVE_CONCURRENCY.record_success();
+                        controller.record_success();
                         Some((network_clone, blocks))
                     }
                     Err(e) => {
                         if is_rate_limited_or_unavailable(&e.to_string()) {
-                            ADAPTIVE_CONCURRENCY.record_rate_limit();
+                            controller.record_rate_limit();
                         } else {
-                            ADAPTIVE_CONCURRENCY.record_error();
+                            controller.record_error();
                         }
                         crate::metrics::definitions::BLOCK_TIMESTAMP_FETCH_FAILURES_TOTAL
                             .with_label_values(&[&network_clone])

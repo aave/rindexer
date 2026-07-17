@@ -1,6 +1,4 @@
-use crate::adaptive_concurrency::{
-    is_rate_limited_or_unavailable, AdaptiveConcurrency, ADAPTIVE_CONCURRENCY,
-};
+use crate::adaptive_concurrency::{is_rate_limited_or_unavailable, AdaptiveConcurrency};
 use crate::blockclock::BlockClock;
 use crate::database::clickhouse::client::ClickhouseClient;
 use crate::event::callback_registry::{EventCallbackRegistry, TraceCallbackRegistry};
@@ -129,9 +127,10 @@ pub fn fetch_logs_stream(
                 let dispatcher_filter = current_filter.clone();
                 let dispatcher_config = Arc::clone(&config);
                 let dispatcher_cancel = cancel_token.clone();
-                // Shared: a 429 from any worker (any event) shrinks live
-                // concurrency for all of them.
-                let dispatcher_controller = Arc::clone(&ADAPTIVE_CONCURRENCY);
+                // Shared per network: a 429 from any worker (any event) shrinks
+                // live concurrency for all workers on this network.
+                let dispatcher_controller =
+                    Arc::clone(config.network_contract().cached_provider.adaptive_controller());
                 let dispatcher_active = Arc::clone(&active_workers);
                 let dispatcher_notify = Arc::clone(&worker_done_notify);
                 let dispatcher_handle = tokio::spawn(async move {
@@ -527,8 +526,9 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
             // Rate-limit / unavailability errors aren't block-range problems, so don't
             // shrink: back off and retry the same range (bounded by the snapshot, so valid).
             if classify_fetch_error(&err) == FetchErrorKind::RateLimit {
-                ADAPTIVE_CONCURRENCY.record_rate_limit();
-                let backoff_ms = ADAPTIVE_CONCURRENCY.current_backoff_ms();
+                let controller = cached_provider.adaptive_controller();
+                controller.record_rate_limit();
+                let backoff_ms = controller.current_backoff_ms();
                 warn!(
                     "{} - {} - Provider rate-limited/unavailable fetching logs in range {} - {}; backing off {}ms before retrying: {:?}",
                     info_log_name,
@@ -584,7 +584,7 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
                 });
             }
 
-            ADAPTIVE_CONCURRENCY.record_error();
+            cached_provider.adaptive_controller().record_error();
             let halved_to_block = halved_block_number(to_block, from_block);
 
             // Handle deserialization, networking, and other non-rpc related errors.
@@ -1636,9 +1636,9 @@ async fn live_indexing_stream(
                                         // ahead of head -> -32000 -> tight zero-delay loop. Back off
                                         // instead.
                                         if classify_fetch_error(&err) == FetchErrorKind::RateLimit {
-                                            ADAPTIVE_CONCURRENCY.record_rate_limit();
-                                            let backoff_ms =
-                                                ADAPTIVE_CONCURRENCY.current_backoff_ms();
+                                            let controller = cached_provider.adaptive_controller();
+                                            controller.record_rate_limit();
+                                            let backoff_ms = controller.current_backoff_ms();
 
                                             warn!(
                                                 "{} - {} - Provider rate-limited/unavailable fetching logs in range {} - {}; backing off {}ms before retrying: {:?}",
@@ -1685,7 +1685,7 @@ async fn live_indexing_stream(
 
                                             log_response_to_large_to_block = Some(retry_result.to);
                                         } else {
-                                            ADAPTIVE_CONCURRENCY.record_error();
+                                            cached_provider.adaptive_controller().record_error();
                                             let halved_to_block =
                                                 halved_block_number(to_block, from_block);
 

@@ -1,12 +1,13 @@
 //! Adaptive concurrency control for RPC requests.
 //!
-//! This module provides centralized rate limiting and adaptive scaling for RPC requests.
-//! It's used by both the RPC layer (layer_extensions.rs) and the indexer (tables.rs).
+//! This module provides rate limiting and adaptive scaling for RPC requests. Each
+//! provider owns one controller (see `JsonRpcCachedProvider`), so one network's rate
+//! limits never throttle another network's requests. It's used by the RPC layer
+//! (layer_extensions.rs) and the indexer (tables.rs, fetch_logs.rs).
 
 use crate::metrics::rpc as rpc_metrics;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -23,6 +24,7 @@ static CONTROLLER_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
 
 /// Adaptive concurrency controller that scales based on success/failure rates.
 /// Scales up when requests succeed, scales down when rate limits are hit.
+#[derive(Debug)]
 pub struct AdaptiveConcurrency {
     /// Network name used as the `network` label on the adaptive metrics.
     network: String,
@@ -151,11 +153,9 @@ impl AdaptiveConcurrency {
     /// the backoff; concurrency/batch scale-up stays owned by the batch-fetch
     /// success path (`record_success`) so cheap calls can't inflate it.
     pub fn record_success_backoff_only(&self) {
-        let updated = self
-            .backoff_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                (cur > 0).then_some(cur * 3 / 4)
-            });
+        let updated = self.backoff_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            (cur > 0).then_some(cur * 3 / 4)
+        });
         if let Ok(prev) = updated {
             if prev * 3 / 4 == 0 {
                 info!("Adaptive concurrency: backoff cleared after successful requests");
@@ -307,10 +307,10 @@ impl AdaptiveConcurrency {
 
     /// Time-based recovery safety net.
     ///
-    /// The success path (`record_success`) can stall — under CAS contention, or when live
-    /// streams sit near the chain tip and stop generating fetch successes — leaving a single
-    /// transient rate-limit permanently pinning `backoff_ms`/`current`. Because the controller
-    /// is process-global, that one event throttles every network until the process restarts.
+    /// The success paths can stall — under CAS contention, or when live streams sit near
+    /// the chain tip and stop generating fetch successes — leaving a single transient
+    /// rate-limit permanently pinning `backoff_ms`/`current` for this network until the
+    /// process restarts.
     ///
     /// This runs from the per-request backoff reads: once no rate-limit has occurred for
     /// `max(IDLE_BEFORE_RECOVERY_MS, 2 × backoff)`, it halves the backoff and steps
@@ -339,8 +339,7 @@ impl AdaptiveConcurrency {
         let required_idle_ms =
             std::cmp::max(self.idle_before_recovery_ms, backoff.saturating_mul(2));
         let now = self.now_millis();
-        if now.saturating_sub(self.last_rate_limit_ms.load(Ordering::Relaxed)) < required_idle_ms
-        {
+        if now.saturating_sub(self.last_rate_limit_ms.load(Ordering::Relaxed)) < required_idle_ms {
             return;
         }
 
@@ -416,20 +415,6 @@ pub fn is_rate_limited_or_unavailable(error_message: &str) -> bool {
         || msg.contains("unable to complete request")
         || msg.contains("-32001")
 }
-
-/// Global adaptive concurrency controller for RPC batches. Used by the RPC
-/// layer, indexer, and parallel fetch workers.
-///
-/// `Arc`-wrapped so parallel workers can hold cheap clones and signal the same
-/// shared state the RPC layer signals from.
-pub static ADAPTIVE_CONCURRENCY: Lazy<Arc<AdaptiveConcurrency>> = Lazy::new(|| {
-    Arc::new(AdaptiveConcurrency::new(
-        "global", // Metric label; replaced by per-network controllers.
-        20,       // Start with 20 concurrent batches
-        2,        // Minimum 2
-        200,      // Maximum 200
-    ))
-});
 
 #[cfg(test)]
 mod tests {

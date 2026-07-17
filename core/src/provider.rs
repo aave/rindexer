@@ -1,4 +1,4 @@
-use crate::adaptive_concurrency::ADAPTIVE_CONCURRENCY;
+use crate::adaptive_concurrency::AdaptiveConcurrency;
 use crate::notifications::ChainStateNotification;
 use alloy::network::{AnyNetwork, AnyRpcBlock, AnyTransactionReceipt};
 use alloy::rpc::types::{Filter, ValueOrArray};
@@ -67,6 +67,9 @@ pub trait ChainProvider: Send + Sync + Debug {
     fn chain(&self) -> Chain;
     fn max_block_range(&self) -> Option<U64>;
     fn chain_state_notification(&self) -> Option<Sender<ChainStateNotification>>;
+    /// This provider's adaptive rate-limit controller. Per-provider so one
+    /// network's rate limits never throttle another network's requests.
+    fn adaptive_controller(&self) -> &Arc<AdaptiveConcurrency>;
 
     async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError>;
     async fn get_block_number(&self) -> Result<U64, ProviderError>;
@@ -121,6 +124,17 @@ const DEFAULT_RPC_SUPPORTED_ACCOUNT_FILTERS: usize = 1000;
 /// Maximum RPC batching size available for the provider.
 pub const RPC_CHUNK_SIZE: usize = 1000;
 
+/// Build a provider's adaptive rate-limit controller with the standard limits.
+/// Labeled with the chain name so metrics match the RPC layer's `network` label.
+fn default_adaptive_controller(chain: Chain) -> AdaptiveConcurrency {
+    AdaptiveConcurrency::new(
+        chain.to_string(),
+        20,  // Start with 20 concurrent batches
+        2,   // Minimum 2
+        200, // Maximum 200
+    )
+}
+
 /// Recommended chunk sizes for batch RPC requests.
 /// See: https://www.alchemy.com/docs/best-practices-when-using-alchemy#2-avoid-high-batch-cardinality
 pub const RECOMMENDED_RPC_CHUNK_SIZE: usize = 50;
@@ -131,6 +145,9 @@ pub struct JsonRpcCachedProvider {
     client: RpcClient,
     cache: Mutex<Option<(Instant, Arc<AnyRpcBlock>)>>,
     is_zk_chain: bool,
+    /// Adaptive rate-limit controller for this provider's endpoint, shared
+    /// with the RPC logging layer that records its rate-limit events.
+    adaptive: Arc<AdaptiveConcurrency>,
     pub chain: Chain,
     block_poll_frequency: Option<BlockPollFrequency>,
     address_filtering: Option<AddressFiltering>,
@@ -495,8 +512,7 @@ impl JsonRpcCachedProvider {
     ) -> Result<Vec<AnyRpcBlock>, ProviderError> {
         let chain_id = self.chain.id();
         // Use adaptive batch size (auto-scales down on rate limits for free nodes)
-        let batch_size =
-            rpc_batch_size.unwrap_or_else(|| ADAPTIVE_CONCURRENCY.current_batch_size());
+        let batch_size = rpc_batch_size.unwrap_or_else(|| self.adaptive.current_batch_size());
 
         if block_numbers.is_empty() {
             return Ok(Vec::new());
@@ -567,8 +583,7 @@ impl JsonRpcCachedProvider {
 
         // Use adaptive batch size (scales down on rate limits for free nodes)
         // Cap at RPC_CHUNK_SIZE for efficiency on paid nodes
-        let batch_size =
-            std::cmp::min(RPC_CHUNK_SIZE, ADAPTIVE_CONCURRENCY.current_batch_size() * 10);
+        let batch_size = std::cmp::min(RPC_CHUNK_SIZE, self.adaptive.current_batch_size() * 10);
         let futures = hashes
             .chunks(batch_size)
             .map(|chunk| {
@@ -742,6 +757,7 @@ impl JsonRpcCachedProvider {
             client,
             cache: Mutex::new(None),
             is_zk_chain,
+            adaptive: Arc::new(default_adaptive_controller(chain)),
             chain,
             block_poll_frequency: None,
             address_filtering: None,
@@ -765,6 +781,10 @@ impl ChainProvider for JsonRpcCachedProvider {
 
     fn chain_state_notification(&self) -> Option<Sender<ChainStateNotification>> {
         self.chain_state_notification.clone()
+    }
+
+    fn adaptive_controller(&self) -> &Arc<AdaptiveConcurrency> {
+        &self.adaptive
     }
 
     async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError> {
@@ -853,6 +873,10 @@ impl<T: ChainProvider + ?Sized> ChainProvider for Arc<T> {
         (**self).chain_state_notification()
     }
 
+    fn adaptive_controller(&self) -> &Arc<AdaptiveConcurrency> {
+        (**self).adaptive_controller()
+    }
+
     async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError> {
         (**self).get_latest_block().await
     }
@@ -939,18 +963,21 @@ pub mod mock {
         block_number: U64,
         receipts: Vec<AnyTransactionReceipt>,
         traces: Vec<LocalizedTransactionTrace>,
+        adaptive: Arc<AdaptiveConcurrency>,
     }
 
     impl MockChainProvider {
         pub fn new(chain_id: u64) -> Self {
+            let chain = Chain::from(chain_id);
             Self {
-                chain: Chain::from(chain_id),
+                chain,
                 max_block_range: None,
                 logs: vec![],
                 blocks: vec![],
                 block_number: U64::ZERO,
                 receipts: vec![],
                 traces: vec![],
+                adaptive: Arc::new(default_adaptive_controller(chain)),
             }
         }
 
@@ -992,6 +1019,10 @@ pub mod mock {
 
         fn chain_state_notification(&self) -> Option<Sender<ChainStateNotification>> {
             None
+        }
+
+        fn adaptive_controller(&self) -> &Arc<AdaptiveConcurrency> {
+            &self.adaptive
         }
 
         async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError> {
@@ -1144,6 +1175,9 @@ pub async fn create_client(
     chain_state_notification: Option<Sender<ChainStateNotification>>,
 ) -> Result<Arc<JsonRpcCachedProvider>, RetryClientError> {
     let chain = Chain::from(chain_id);
+    // Shared between the logging layer (which records rate-limit events) and the
+    // provider (whose batch/fetch paths read limits and wait out backoff).
+    let adaptive = Arc::new(default_adaptive_controller(chain));
 
     let (client, provider) = if rpc_url.ends_with(".ipc") {
         if !fallback_rpcs.is_empty() {
@@ -1158,7 +1192,8 @@ pub async fn create_client(
             1000,
             compute_units_per_second.unwrap_or(660),
         );
-        let logging_layer = RpcLoggingLayer::new(chain_id, rpc_url.to_string());
+        let logging_layer =
+            RpcLoggingLayer::new(chain_id, rpc_url.to_string(), Arc::clone(&adaptive));
 
         let rpc_client =
             RpcClient::builder().layer(retry_layer).layer(logging_layer).ipc(ipc.clone()).await?;
@@ -1185,7 +1220,8 @@ pub async fn create_client(
         // Label metrics/logs with the primary URL. Metrics are keyed by network+method (not
         // per-URL), and the logging layer wraps the fallback service, so it records the net
         // outcome after any failover — correct for backoff/rate-limit accounting.
-        let logging_layer = RpcLoggingLayer::new(chain_id, rpc_url.to_string());
+        let logging_layer =
+            RpcLoggingLayer::new(chain_id, rpc_url.to_string(), Arc::clone(&adaptive));
         let retry_layer = RetryBackoffLayer::new(
             MAX_RPC_RATE_LIMIT_RETRIES,
             1000,
@@ -1262,6 +1298,7 @@ pub async fn create_client(
         client,
         chain,
         is_zk_chain,
+        adaptive,
         block_poll_frequency,
         address_filtering,
         chain_state_notification,
