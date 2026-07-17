@@ -1,0 +1,51 @@
+core/src/adaptive_concurrency.rs
+  s_6bf5de4e97eff5::t_ff1312f2a6ce4f 218
+  s_070dfd3c254091::t_14f99fe65cf970 300-308,313,318,324-327,337-342,344-350,362-366,371-386
+  s_070dfd3c254091::t_5cebfc417c94c6 49-51
+  s_070dfd3c254091::t_c78d0369ab087b 336
+  s_070dfd3c254091::t_803033c2ea4c4b 10,13-23
+  s_070dfd3c254091::t_367545f4bb83bb 102-106,108
+  s_6bf5de4e97eff5::t_0543b7ea60efcf 430-432,440-443,464,482-483,506-549,551-567
+  s_070dfd3c254091::t_d9ec1d2c3d2772 217
+  s_070dfd3c254091::t_75c469f5e96c52 131
+  s_070dfd3c254091::t_7b1367073a1276 367-370
+  s_070dfd3c254091::t_8f9f1b69331128 216,220-231,233-239
+  s_070dfd3c254091::t_19704e898c461f 46-48
+  s_070dfd3c254091::t_9fc8ed37f7305e 8
+  s_070dfd3c254091::t_a9aae903b68aa6 75
+  s_070dfd3c254091::t_daa8dc5b52a452 78-79
+  s_6bf5de4e97eff5::t_834c6deb9612af 80-81,85-89
+  s_6bf5de4e97eff5::t_e4414e977de310 309-312,314-317,319-323,328-335,351-361
+  s_070dfd3c254091::t_0c1de05e91242e 90,425-429,433-439,444-463,465-481,484-505,550,568-569
+  s_070dfd3c254091::t_991f055379a4a9 76-77
+  s_070dfd3c254091::t_5475e1b598b435 343
+  s_6bf5de4e97eff5::t_83dcebcacda550 56-58
+  s_070dfd3c254091::t_d649fb43c9089f 52-55
+  s_6bf5de4e97eff5::t_25ab132d92d06f 139-153,156,158-162
+  s_070dfd3c254091::t_7ca4045f6b3dc7 91
+  s_070dfd3c254091::t_3660cbd7bf5579 232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6107b33bf68977a9fd0c248ab05ea3f6ad9804e4",
+  "prompts": {},
+  "sessions": {
+    "s_070dfd3c254091": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6fac3254-a8c5-4e8f-bcc8-9f363d1146ed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Mark Grothe <grothem@gmail.com>"
+    },
+    "s_6bf5de4e97eff5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c2cadb6b-3092-42ac-ae9a-9ca4b5809222",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Mark Grothe <grothem@gmail.com>"
+    }
+  }
+}
