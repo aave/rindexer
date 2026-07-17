@@ -1,0 +1,28 @@
+core/src/metrics/rpc.rs
+  s_6bf5de4e97eff5::t_cef7070938a626 29-33,36-38
+core/src/metrics/definitions.rs
+  s_6bf5de4e97eff5::t_a7d6a324317b13 135-138,140-141
+  s_6bf5de4e97eff5::t_2af0388fe04ec6 146-150,152-153,158-161,163-164,169-177
+core/src/adaptive_concurrency.rs
+  s_6bf5de4e97eff5::t_abd4cf5e46b839 427-430
+  s_6bf5de4e97eff5::t_25e364cb689838 27-28
+  s_6bf5de4e97eff5::t_23eac18a9ff2f8 442,458,506,521,543,565-566
+  s_6bf5de4e97eff5::t_b6d8f3e2eef9e2 64,66
+  s_6bf5de4e97eff5::t_a005f1be10b0cd 124,129-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "906620e806537746e64b99a67da2e6abe6a4f0a9",
+  "prompts": {},
+  "sessions": {
+    "s_6bf5de4e97eff5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c2cadb6b-3092-42ac-ae9a-9ca4b5809222",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Mark Grothe <grothem@gmail.com>"
+    }
+  }
+}
