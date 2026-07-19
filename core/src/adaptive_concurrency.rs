@@ -391,10 +391,8 @@ impl AdaptiveConcurrency {
         // current instead of clobbering a concurrent scale-down/backoff-increase with a
         // value derived from a stale read.
         let pre_backoff = self.backoff_ms.load(Ordering::Relaxed);
-        let backoff_update = self.backoff_ms.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| {
+        let backoff_update =
+            self.backoff_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 // A concurrent rate-limit that raised backoff past our read must win:
                 // don't undo it.
                 if cur == 0 || cur > pre_backoff {
@@ -404,8 +402,7 @@ impl AdaptiveConcurrency {
                 } else {
                     Some(cur / 2)
                 }
-            },
-        );
+            });
         match backoff_update {
             Ok(prev) => {
                 if prev <= BACKOFF_CLEAR_FLOOR_MS {
