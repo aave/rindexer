@@ -446,8 +446,15 @@ impl AdaptiveConcurrency {
 pub fn is_rate_limited_or_unavailable(error_message: &str) -> bool {
     let msg = error_message.to_lowercase();
 
-    // Classic rate-limit / throttle signals.
-    msg.contains("429")
+    // Classic rate-limit / throttle signals. `429` must stay anchored to an
+    // http/status/code token: block numbers and hex ranges embedded in other
+    // errors (e.g. "this block range should work: [0x1429680, ...]") contain
+    // bare "429" and must not classify as rate limits.
+    msg.contains("http error 429")
+        || msg.contains("status: 429")
+        || msg.contains("status code 429")
+        || msg.contains("error code 429")
+        || msg.contains("code: 429")
         || msg.contains("rate limit")
         || msg.contains("rate-limit")
         || msg.contains("rate exceeded")
@@ -605,5 +612,24 @@ mod tests {
         assert!(ethereum.current() < 20);
         assert_eq!(backoff(&avalanche), 0, "unrelated controller keeps zero backoff");
         assert_eq!(avalanche.current(), 20, "unrelated controller keeps full concurrency");
+    }
+
+    #[test]
+    fn rate_limit_classifier_requires_anchored_429() {
+        // Real 429 shapes: alloy HttpError display, alloy ErrorPayload display,
+        // and reqwest-style status text.
+        assert!(is_rate_limited_or_unavailable("HTTP error 429 with body: slow down"));
+        assert!(is_rate_limited_or_unavailable(
+            "server returned an error response: error code 429: capacity exceeded"
+        ));
+        assert!(is_rate_limited_or_unavailable("429 Too Many Requests"));
+
+        // Block numbers / hex ranges containing "429" must not classify as
+        // rate limits — misfiring here backs off and retries the same
+        // oversized range instead of shrinking it.
+        assert!(!is_rate_limited_or_unavailable(
+            "query exceeds max results, this block range should work: [0x1429680, 0x142a000]"
+        ));
+        assert!(!is_rate_limited_or_unavailable("block range too large: 21429000-21439000"));
     }
 }
