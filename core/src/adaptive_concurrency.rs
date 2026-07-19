@@ -4,6 +4,17 @@
 //! provider owns one controller (see `JsonRpcCachedProvider`), so one network's rate
 //! limits never throttle another network's requests. It's used by the RPC layer
 //! (layer_extensions.rs) and the indexer (tables.rs, fetch_logs.rs).
+//!
+//! ## Adaptation granularity
+//!
+//! Backoff is the only control that adapts *within* a running fetch: it is read live
+//! before every request (`current_backoff_ms`, `wait_for_backoff`). Concurrency
+//! (`current`) and `batch_size` are read once at the top of each `prefetch_*`
+//! invocation into a fixed-size semaphore / chunk size, so any scale-up/down recorded
+//! *during* that invocation only takes effect on the *next* one. This is safe because
+//! invocations are scoped to a single (naturally small) event batch, so the staleness
+//! is bounded to one batch. Do not assume `current` throttles in-flight work in real
+//! time — it does not; backoff does.
 
 use crate::metrics::rpc as rpc_metrics;
 use once_cell::sync::Lazy;
@@ -17,6 +28,18 @@ const IDLE_BEFORE_RECOVERY_MS: u64 = 5_000;
 const RECOVERY_INTERVAL_MS: u64 = 2_000;
 /// Backoff at or below this (ms) is cleared to zero rather than halved again.
 const BACKOFF_CLEAR_FLOOR_MS: u64 = 100;
+/// Consecutive batch-fetch successes before concurrency/batch scale up one step.
+const SCALE_UP_THRESHOLD: usize = 10;
+/// First backoff step applied on the initial rate-limit event.
+const INITIAL_BACKOFF_MS: u64 = 500;
+/// Ceiling on backoff growth.
+const MAX_BACKOFF_MS: u64 = 30_000;
+/// Initial RPC batch size (calls per batch).
+const INITIAL_BATCH_SIZE: usize = 50;
+/// Minimum RPC batch size.
+const MIN_BATCH_SIZE: usize = 5;
+/// Maximum RPC batch size.
+const MAX_BATCH_SIZE: usize = 100;
 
 /// Monotonic epoch for the controller's internal timestamps. `Instant` isn't
 /// atomic-storable, so timestamps are kept as millis elapsed since this epoch.
@@ -70,12 +93,12 @@ impl AdaptiveConcurrency {
             min,
             max,
             consecutive_successes: AtomicUsize::new(0),
-            scale_up_threshold: 10, // Scale up after 10 consecutive successes
+            scale_up_threshold: SCALE_UP_THRESHOLD,
             backoff_ms: AtomicU64::new(0),
-            max_backoff_ms: 30_000,           // Max 30 second backoff
-            batch_size: AtomicUsize::new(50), // Start with 50 calls per batch
-            min_batch_size: 5,                // Minimum 5 calls per batch
-            max_batch_size: 100,              // Maximum 100 calls per batch
+            max_backoff_ms: MAX_BACKOFF_MS,
+            batch_size: AtomicUsize::new(INITIAL_BATCH_SIZE),
+            min_batch_size: MIN_BATCH_SIZE,
+            max_batch_size: MAX_BATCH_SIZE,
             rate_limit_count: AtomicU64::new(0),
             ever_rate_limited: AtomicBool::new(false),
             last_rate_limit_ms: AtomicU64::new(0),
@@ -145,13 +168,13 @@ impl AdaptiveConcurrency {
         }
     }
 
-    /// Record a successful RPC response by decaying backoff only (by 25%).
+    /// Decay backoff by 25% without touching concurrency/batch scale-up.
     ///
-    /// Used by the RPC layer (`layer_extensions.rs`), where every kind of call —
-    /// including cheap polling like `eth_blockNumber` — completes. A successful
-    /// response is direct evidence the provider is healthy again, so it decays
-    /// the backoff; concurrency/batch scale-up stays owned by the batch-fetch
-    /// success path (`record_success`) so cheap calls can't inflate it.
+    /// Internal helper for `record_success`: only batch-fetch successes are strong
+    /// enough evidence to decay backoff. The RPC layer deliberately does NOT call
+    /// this — a cheap call (e.g. `eth_blockNumber`) can succeed while a
+    /// compute-weight limiter is still throttling heavy calls, so layer-level
+    /// successes must not clear backoff (see `layer_extensions.rs`).
     pub fn record_success_backoff_only(&self) {
         let updated = self.backoff_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             (cur > 0).then_some(cur * 3 / 4)
@@ -231,19 +254,19 @@ impl AdaptiveConcurrency {
             .backoff_ms
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(if cur == 0 {
-                    500
+                    INITIAL_BACKOFF_MS
                 } else {
                     std::cmp::min(max_backoff_ms, cur.saturating_mul(2))
                 })
             })
             .map(|prev| {
                 if prev == 0 {
-                    500
+                    INITIAL_BACKOFF_MS
                 } else {
                     std::cmp::min(max_backoff_ms, prev.saturating_mul(2))
                 }
             })
-            .unwrap_or(500);
+            .unwrap_or(INITIAL_BACKOFF_MS);
 
         // Scale down batch size by 50%
         let current_batch = self.batch_size.load(Ordering::Relaxed);
@@ -362,31 +385,55 @@ impl AdaptiveConcurrency {
         {
             return;
         }
-        let backoff = self.backoff_ms.load(Ordering::Relaxed);
-        let concurrency = self.current.load(Ordering::Relaxed);
-        let batch = self.batch_size.load(Ordering::Relaxed);
-
-        if backoff > 0 {
-            let new_backoff = if backoff <= BACKOFF_CLEAR_FLOOR_MS { 0 } else { backoff / 2 };
-            self.backoff_ms.store(new_backoff, Ordering::Relaxed);
-            if new_backoff == 0 {
-                info!(
-                    "Adaptive: backoff cleared after {}ms idle (recovered)",
-                    self.idle_before_recovery_ms
-                );
+        // Race-safe recovery: a `record_rate_limit` can still land in the tiny window
+        // between the re-check above and these writes. `fetch_update` re-reads the live
+        // value on each attempt, so recovery steps *toward* its target from whatever is
+        // current instead of clobbering a concurrent scale-down/backoff-increase with a
+        // value derived from a stale read.
+        let pre_backoff = self.backoff_ms.load(Ordering::Relaxed);
+        let backoff_update = self.backoff_ms.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| {
+                // A concurrent rate-limit that raised backoff past our read must win:
+                // don't undo it.
+                if cur == 0 || cur > pre_backoff {
+                    None
+                } else if cur <= BACKOFF_CLEAR_FLOOR_MS {
+                    Some(0)
+                } else {
+                    Some(cur / 2)
+                }
+            },
+        );
+        match backoff_update {
+            Ok(prev) => {
+                if prev <= BACKOFF_CLEAR_FLOOR_MS {
+                    info!(
+                        "Adaptive: backoff cleared after {}ms idle (recovered)",
+                        self.idle_before_recovery_ms
+                    );
+                }
             }
+            // A rate limit landed mid-tick and raised backoff past our read: it must
+            // win for all three knobs, so skip the concurrency/batch scale-ups too.
+            // (`record_rate_limit` publishes metrics itself.)
+            Err(cur) if cur > pre_backoff => return,
+            // Backoff already at zero — nothing to decay, but concurrency/batch may
+            // still need stepping back up.
+            Err(_) => {}
         }
 
-        if concurrency < self.max {
-            let increase = std::cmp::max(1, concurrency / 5);
-            self.current.store(std::cmp::min(self.max, concurrency + increase), Ordering::Relaxed);
-        }
-
-        if batch < self.max_batch_size {
-            let increase = std::cmp::max(5, batch / 5);
-            self.batch_size
-                .store(std::cmp::min(self.max_batch_size, batch + increase), Ordering::Relaxed);
-        }
+        // Step concurrency/batch up from the live value; no-op once at max. Stepping from
+        // `cur` (not a stale read) means a concurrent scale-down is preserved — recovery
+        // adds at most one step to whatever the rate-limit path left behind.
+        let _ = self.current.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            (cur < self.max).then(|| std::cmp::min(self.max, cur + std::cmp::max(1, cur / 5)))
+        });
+        let _ = self.batch_size.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            (cur < self.max_batch_size)
+                .then(|| std::cmp::min(self.max_batch_size, cur + std::cmp::max(5, cur / 5)))
+        });
 
         self.publish_metrics();
     }
@@ -524,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn rpc_layer_success_decays_backoff_without_scaling_up() {
+    fn backoff_only_decay_does_not_scale_up() {
         let c = AdaptiveConcurrency::new("testnet", 20, 2, 200);
         c.record_rate_limit();
         c.record_rate_limit();

@@ -107,10 +107,14 @@ where
                 Ok(response) => {
                     let duration = start_time.elapsed();
 
-                    // A successful response is direct evidence the provider is healthy:
-                    // decay any active backoff (concurrency scale-up stays owned by the
-                    // batch-fetch success paths).
-                    adaptive.record_success_backoff_only();
+                    // Backoff decay is intentionally NOT driven from here. A layer-level
+                    // success may be a cheap call (e.g. `eth_blockNumber`) that a
+                    // compute-weight limiter lets through while heavier calls are still
+                    // throttled, so decaying on it would prematurely clear backoff and let
+                    // the heavy calls re-trip the limiter. Decay is owned by the batch-fetch
+                    // success paths (heavy-call evidence) and the time-based
+                    // `recover_if_idle` safety net — which this request already drives via
+                    // the `current_backoff_ms()` read above.
 
                     if duration.as_secs() >= 10 {
                         rpc_metrics::record_slow_call(&network, &method_name);
