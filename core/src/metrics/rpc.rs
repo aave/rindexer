@@ -26,16 +26,16 @@ pub fn record_slow_call(network: &str, method: &str) {
     RPC_SLOW_CALLS_TOTAL.with_label_values(&[network, method]).inc();
 }
 
-/// Publish the adaptive-concurrency controller state as gauges (global controller).
-pub fn set_adaptive_state(concurrency: usize, batch_size: usize, backoff_ms: u64) {
-    RPC_ADAPTIVE_CONCURRENCY.set(concurrency as f64);
-    RPC_ADAPTIVE_BATCH_SIZE.set(batch_size as f64);
-    RPC_ADAPTIVE_BACKOFF_MS.set(backoff_ms as f64);
+/// Publish a network's adaptive-concurrency controller state as gauges.
+pub fn set_adaptive_state(network: &str, concurrency: usize, batch_size: usize, backoff_ms: u64) {
+    RPC_ADAPTIVE_CONCURRENCY.with_label_values(&[network]).set(concurrency as f64);
+    RPC_ADAPTIVE_BATCH_SIZE.with_label_values(&[network]).set(batch_size as f64);
+    RPC_ADAPTIVE_BACKOFF_MS.with_label_values(&[network]).set(backoff_ms as f64);
 }
 
-/// Publish the running total of rate-limit/unavailability events.
-pub fn set_rate_limit_events(total: u64) {
-    RPC_RATE_LIMIT_EVENTS_TOTAL.set(total as f64);
+/// Publish a network's running total of rate-limit/unavailability events.
+pub fn set_rate_limit_events(network: &str, total: u64) {
+    RPC_RATE_LIMIT_EVENTS_TOTAL.with_label_values(&[network]).set(total as f64);
 }
 
 /// Record a completed RPC request.
