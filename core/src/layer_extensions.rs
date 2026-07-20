@@ -111,6 +111,13 @@ where
                         );
                     }
 
+                    // Guard: a JSON-RPC *error payload* over a successful HTTP call (e.g. Alchemy's
+                    // -32001 over HTTP 200) also lands in this Ok branch — that is the outage
+                    // signal itself and must not decay the backoff.
+                    if !has_throttle_error_payload(&response) {
+                        ADAPTIVE_CONCURRENCY.record_success();
+                    }
+
                     Ok(response)
                 }
                 Err(err) => {
@@ -171,6 +178,18 @@ where
     }
 }
 
+/// True when the response packet carries a JSON-RPC error payload signalling throttling or
+/// temporary unavailability (e.g. Alchemy `-32001` delivered over HTTP 200). Such a transport-
+/// level "success" is really the outage signal and must not decay the adaptive backoff.
+///
+/// Matches on code + message only - `data` is deliberately excluded because it can carry
+/// arbitrary hex/block numbers that false-positive loose tokens like `"429"`.
+fn has_throttle_error_payload(response: &ResponsePacket) -> bool {
+    response
+        .iter_errors()
+        .any(|e| is_rate_limited_or_unavailable(&format!("error code {}: {}", e.code, e.message)))
+}
+
 fn is_known_retryable_error(error_message: &str) -> bool {
     // mirror handled logic which is in the `retry_with_block_range`
     error_message.contains("this block range should work")
@@ -180,4 +199,68 @@ fn is_known_retryable_error(error_message: &str) -> bool {
         || error_message.contains("block range too large")
         || error_message.contains("response is too big")
         || error_message.contains("error decoding response body")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::rpc::json_rpc::Response;
+
+    fn packet(json: &str) -> ResponsePacket {
+        ResponsePacket::Single(serde_json::from_str::<Response>(json).expect("valid response"))
+    }
+
+    #[test]
+    fn success_payload_is_not_throttle() {
+        let p = packet(r#"{"jsonrpc":"2.0","id":1,"result":"0x10"}"#);
+        assert!(!has_throttle_error_payload(&p));
+    }
+
+    #[test]
+    fn alchemy_32001_over_http_200_is_throttle() {
+        // The exact shape from the incident: HTTP 200 + JSON-RPC error payload.
+        let p = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Unable to complete request at this time."}}"#,
+        );
+        assert!(has_throttle_error_payload(&p));
+    }
+
+    #[test]
+    fn rate_limit_message_is_throttle() {
+        let p = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"too many requests"}}"#,
+        );
+        assert!(has_throttle_error_payload(&p));
+    }
+
+    #[test]
+    fn block_range_error_is_not_throttle() {
+        // Routine range-probing errors must still count as provider-alive (decay allowed).
+        let p = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"block range too large"}}"#,
+        );
+        assert!(!has_throttle_error_payload(&p));
+    }
+
+    #[test]
+    fn numeric_noise_in_data_does_not_false_positive() {
+        // "429" inside the error data must not be mistaken for HTTP 429 — the
+        // helper matches on code + message only.
+        let p = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params","data":"0x429abc"}}"#,
+        );
+        assert!(!has_throttle_error_payload(&p));
+    }
+
+    #[test]
+    fn batch_with_one_throttle_error_is_throttle() {
+        let ok = serde_json::from_str::<Response>(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#)
+            .expect("valid response");
+        let throttled = serde_json::from_str::<Response>(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"Unable to complete request at this time."}}"#,
+        )
+        .expect("valid response");
+        let p = ResponsePacket::Batch(vec![ok, throttled]);
+        assert!(has_throttle_error_payload(&p));
+    }
 }

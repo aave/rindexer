@@ -276,3 +276,50 @@ pub static ADAPTIVE_CONCURRENCY: Lazy<Arc<AdaptiveConcurrency>> = Lazy::new(|| {
         200, // Maximum 200
     ))
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a rate-limit raises the backoff, and repeated successes must wind it
+    // back down to zero. Before the RPC layer recorded successes, a triggered backoff
+    // never reset and delayed every request indefinitely.
+    #[test]
+    fn backoff_resets_to_zero_after_successes() {
+        let c = AdaptiveConcurrency::new(20, 2, 200);
+
+        c.record_rate_limit();
+        assert!(c.current_backoff_ms() > 0, "rate limit must raise the backoff");
+
+        // Each success reduces the backoff by 25%; it must reach exactly 0 (not floor
+        // at a small positive value that would keep throttling forever).
+        for _ in 0..100 {
+            if c.current_backoff_ms() == 0 {
+                break;
+            }
+            c.record_success();
+        }
+
+        assert_eq!(c.current_backoff_ms(), 0, "backoff must fully reset after sustained success");
+    }
+
+    #[test]
+    fn repeated_rate_limits_cap_backoff_but_success_still_clears_it() {
+        let c = AdaptiveConcurrency::new(20, 2, 200);
+
+        // Drive the backoff up to its ceiling.
+        for _ in 0..20 {
+            c.record_rate_limit();
+        }
+        let peak = c.current_backoff_ms();
+        assert!(peak > 0);
+
+        for _ in 0..200 {
+            if c.current_backoff_ms() == 0 {
+                break;
+            }
+            c.record_success();
+        }
+        assert_eq!(c.current_backoff_ms(), 0, "even a maxed-out backoff must clear on recovery");
+    }
+}
