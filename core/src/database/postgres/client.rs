@@ -329,22 +329,32 @@ impl PostgresClient {
         column_types: &[PgType],
         data: &[Vec<EthereumSqlTypeWrapper>],
     ) -> Result<(), BulkInsertPostgresError> {
-        let stmt = format!(
-            "COPY {} ({}) FROM STDIN WITH (FORMAT binary)",
-            table_name,
-            generate_event_table_columns_names_sql(column_names),
-        );
+        let columns_sql = generate_event_table_columns_names_sql(column_names);
 
-        // info!("Bulk insert statement: {}", stmt);
+        // COPY cannot skip conflicting rows, so a replayed batch — e.g. after a crash
+        // between an insert and the last-synced-block write — would fail on a unique
+        // index forever and wedge the event stream. COPY into a transaction-scoped
+        // temp table instead, then move the rows across with ON CONFLICT DO NOTHING
+        // (a no-op for tables without unique constraints).
+        let temp_table = format!("rindexer_copy_{}", table_name.replace(['.', '"'], "_"));
+
+        let mut conn = self.pool.get().await.map_err(PostgresError::ConnectionPoolError)?;
+        let txn = conn.transaction().await.map_err(PostgresError::PgError)?;
+
+        txn.batch_execute(&format!(
+            "CREATE TEMP TABLE {temp_table} (LIKE {table_name} INCLUDING DEFAULTS) ON COMMIT DROP",
+        ))
+        .await
+        .map_err(PostgresError::PgError)?;
+
+        let stmt = format!("COPY {temp_table} ({columns_sql}) FROM STDIN WITH (FORMAT binary)");
 
         let prepared_data: Vec<Vec<&(dyn ToSql + Sync)>> = data
             .iter()
             .map(|row| row.iter().map(|param| param as &(dyn ToSql + Sync)).collect())
             .collect();
 
-        // info!("Prepared data: {:?}", prepared_data);
-
-        let sink = self.copy_in(&stmt).await?;
+        let sink = txn.copy_in(&stmt).await.map_err(PostgresError::PgError)?;
 
         let writer = BinaryCopyInWriter::new(sink, column_types);
         pin_mut!(writer);
@@ -362,6 +372,17 @@ impl PostgresClient {
         }
 
         writer.finish().await?;
+
+        txn.execute(
+            &format!(
+                "INSERT INTO {table_name} ({columns_sql}) SELECT {columns_sql} FROM {temp_table} ON CONFLICT DO NOTHING"
+            ),
+            &[],
+        )
+        .await
+        .map_err(PostgresError::PgError)?;
+
+        txn.commit().await.map_err(PostgresError::PgError)?;
 
         Ok(())
     }
@@ -412,6 +433,10 @@ impl PostgresClient {
                 params.push(param as &(dyn ToSql + Sync));
             }
         }
+
+        // A replayed batch (crash between insert and cursor write, redelivery) must
+        // not wedge the stream on a unique index; no-op for unconstrained tables.
+        query.push_str(" ON CONFLICT DO NOTHING");
 
         // Good for debugging
         // tracing::info!("query: {:?}", query);
