@@ -46,12 +46,13 @@ use thiserror::Error;
 use tokio::sync::{broadcast::Sender, Mutex, Semaphore};
 use tokio::task::JoinError;
 use tower::Layer;
-use tracing::{debug, debug_span, error, warn, Instrument};
+use tracing::{debug, debug_span, error, info, warn, Instrument};
 use url::Url;
 
 use async_trait::async_trait;
 
 use crate::helpers::chunk_hashset;
+use crate::indexer::tip_logs::{BlockLogsSource, SharedTipLogs, SharedTipLogsSettings};
 use crate::layer_extensions::RpcLoggingLayer;
 use crate::manifest::network::{AddressFiltering, BlockPollFrequency};
 use crate::metrics::rpc as rpc_metrics;
@@ -62,6 +63,9 @@ use crate::{event::RindexerEventFilter, manifest::core::Manifest};
 /// `JsonRpcCachedProvider` is the production implementation (with caching,
 /// batching, metrics, etc.).  Tests can supply a [`MockChainProvider`] that
 /// returns canned data without touching the network.
+// `async_trait` expands every `async fn` into a `#[must_use]` boxed future; the methods already
+// return `Result`, which clippy on Rust 1.99 reports as a double `must_use`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChainProvider: Send + Sync + Debug {
     fn chain(&self) -> Chain;
@@ -70,6 +74,11 @@ pub trait ChainProvider: Send + Sync + Debug {
     /// This provider's adaptive rate-limit controller. Per-provider so one
     /// network's rate limits never throttle another network's requests.
     fn adaptive_controller(&self) -> &Arc<AdaptiveConcurrency>;
+
+    /// The network's shared tip-block log cache; `None` keeps the per-stream tip `eth_getLogs`.
+    fn shared_tip_logs(&self) -> Option<Arc<SharedTipLogs>> {
+        None
+    }
 
     async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError>;
     async fn get_block_number(&self) -> Result<U64, ProviderError>;
@@ -153,6 +162,7 @@ pub struct JsonRpcCachedProvider {
     address_filtering: Option<AddressFiltering>,
     pub max_block_range: Option<U64>,
     pub chain_state_notification: Option<Sender<ChainStateNotification>>,
+    shared_tip_logs: Option<Arc<SharedTipLogs>>,
 }
 
 #[derive(Error, Debug)]
@@ -763,9 +773,34 @@ impl JsonRpcCachedProvider {
             address_filtering: None,
             max_block_range: None,
             chain_state_notification: None,
+            shared_tip_logs: None,
         });
 
         (cached, asserter)
+    }
+}
+
+/// The shared tip-block fetcher's source: one unfiltered `eth_getLogs` per block through the raw
+/// provider, counted like every other `eth_getLogs`.
+#[derive(Debug)]
+pub struct RpcBlockLogsSource {
+    network: String,
+    provider: Arc<RindexerProvider>,
+}
+
+#[async_trait]
+impl BlockLogsSource for RpcBlockLogsSource {
+    async fn block_logs(&self, block: u64) -> Result<Vec<Log>, ProviderError> {
+        let start = Instant::now();
+        let filter = Filter::new().from_block(block).to_block(block);
+        let logs = self.provider.get_logs(&filter).await.map_err(ProviderError::from);
+        rpc_metrics::record_rpc_request(
+            &self.network,
+            "eth_getLogs",
+            logs.is_ok(),
+            start.elapsed().as_secs_f64(),
+        );
+        logs
     }
 }
 
@@ -785,6 +820,10 @@ impl ChainProvider for JsonRpcCachedProvider {
 
     fn adaptive_controller(&self) -> &Arc<AdaptiveConcurrency> {
         &self.adaptive
+    }
+
+    fn shared_tip_logs(&self) -> Option<Arc<SharedTipLogs>> {
+        self.shared_tip_logs.clone()
     }
 
     async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError> {
@@ -877,6 +916,10 @@ impl<T: ChainProvider + ?Sized> ChainProvider for Arc<T> {
         (**self).adaptive_controller()
     }
 
+    fn shared_tip_logs(&self) -> Option<Arc<SharedTipLogs>> {
+        (**self).shared_tip_logs()
+    }
+
     async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError> {
         (**self).get_latest_block().await
     }
@@ -964,6 +1007,7 @@ pub mod mock {
         receipts: Vec<AnyTransactionReceipt>,
         traces: Vec<LocalizedTransactionTrace>,
         adaptive: Arc<AdaptiveConcurrency>,
+        shared_tip_logs: Option<Arc<SharedTipLogs>>,
     }
 
     impl MockChainProvider {
@@ -978,6 +1022,7 @@ pub mod mock {
                 receipts: vec![],
                 traces: vec![],
                 adaptive: Arc::new(default_adaptive_controller(chain)),
+                shared_tip_logs: None,
             }
         }
 
@@ -1005,6 +1050,11 @@ pub mod mock {
             self.max_block_range = Some(U64::from(range));
             self
         }
+
+        pub fn with_shared_tip_logs(mut self, handle: Arc<SharedTipLogs>) -> Self {
+            self.shared_tip_logs = Some(handle);
+            self
+        }
     }
 
     #[async_trait]
@@ -1023,6 +1073,10 @@ pub mod mock {
 
         fn adaptive_controller(&self) -> &Arc<AdaptiveConcurrency> {
             &self.adaptive
+        }
+
+        fn shared_tip_logs(&self) -> Option<Arc<SharedTipLogs>> {
+            self.shared_tip_logs.clone()
         }
 
         async fn get_latest_block(&self) -> Result<Option<Arc<AnyRpcBlock>>, ProviderError> {
@@ -1142,6 +1196,9 @@ pub enum RetryClientError {
     #[error("Provider can't be created for {0}: {1}")]
     ProviderCantBeCreated(String, String),
 
+    #[error("RPC URL for {label} is empty. Set the network `rpc` value or the referenced environment variable in `.env` before starting rindexer. Foundry imports leave non-local `CHAIN_<id>_RPC_URL` values empty by default.")]
+    RpcUrlEmpty { label: String },
+
     #[error("Invalid client chain id for {0}. Expected {1}, received {2}")]
     InvalidClientChainId(String, u64, u64),
 
@@ -1153,6 +1210,9 @@ pub enum RetryClientError {
 
     #[error("Could not start reth node for network {0}: {1}")]
     RethNodeStartError(String, String),
+
+    #[error("Could not create hypersync client for network {0}: {1}")]
+    HypersyncClientCantBeCreated(String, String),
 }
 
 /// Max retries the alloy `RetryBackoffLayer` makes per request. Its backoff is
@@ -1162,6 +1222,32 @@ pub enum RetryClientError {
 /// backoff for sustained outages.
 const MAX_RPC_RATE_LIMIT_RETRIES: u32 = 10;
 
+fn ensure_rpc_url_not_empty(
+    label: impl Into<String>,
+    rpc_url: &str,
+) -> Result<(), RetryClientError> {
+    if rpc_url.trim().is_empty() {
+        return Err(RetryClientError::RpcUrlEmpty { label: label.into() });
+    }
+
+    Ok(())
+}
+
+pub fn validate_manifest_network_rpc_urls(manifest: &Manifest) -> Result<(), RetryClientError> {
+    for network in &manifest.networks {
+        ensure_rpc_url_not_empty(
+            format!("`{}` (chain_id {})", network.name, network.chain_id),
+            &network.rpc,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Creates a network provider without the shared tip-block log fetch: its live streams issue
+/// their own tip `eth_getLogs`. Kept with its pre-0.43.5 signature so a `networks.rs` generated
+/// by an earlier version keeps compiling; regenerated typings call
+/// [`create_client_with_shared_tip_logs`] and pass the network's `shared_tip_logs` settings.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_client(
     rpc_url: &str,
@@ -1174,6 +1260,38 @@ pub async fn create_client(
     address_filtering: Option<AddressFiltering>,
     chain_state_notification: Option<Sender<ChainStateNotification>>,
 ) -> Result<Arc<JsonRpcCachedProvider>, RetryClientError> {
+    create_client_with_shared_tip_logs(
+        rpc_url,
+        fallback_rpcs,
+        chain_id,
+        compute_units_per_second,
+        max_block_range,
+        block_poll_frequency,
+        custom_headers,
+        address_filtering,
+        chain_state_notification,
+        None,
+    )
+    .await
+}
+
+/// [`create_client`] plus the network's resolved `shared_tip_logs` settings (`None` disables the
+/// shared tip-block log fetch for this provider).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_client_with_shared_tip_logs(
+    rpc_url: &str,
+    fallback_rpcs: &[String],
+    chain_id: u64,
+    compute_units_per_second: Option<u64>,
+    max_block_range: Option<U64>,
+    block_poll_frequency: Option<BlockPollFrequency>,
+    custom_headers: HeaderMap,
+    address_filtering: Option<AddressFiltering>,
+    chain_state_notification: Option<Sender<ChainStateNotification>>,
+    shared_tip_logs: Option<SharedTipLogsSettings>,
+) -> Result<Arc<JsonRpcCachedProvider>, RetryClientError> {
+    ensure_rpc_url_not_empty(format!("chain_id {chain_id}"), rpc_url)?;
+
     let chain = Chain::from(chain_id);
     // Shared between the logging layer (which records rate-limit events) and the
     // provider (whose batch/fetch paths read limits and wait out backoff).
@@ -1291,8 +1409,17 @@ pub async fn create_client(
         }
     };
 
+    let provider = Arc::new(provider);
+    let shared_tip_logs = match shared_tip_logs {
+        Some(settings) => Some(shared_tip_logs_handle(chain, Arc::clone(&provider), settings)),
+        None => {
+            info!("shared tip logs disabled for {chain}");
+            None
+        }
+    };
+
     Ok(Arc::new(JsonRpcCachedProvider {
-        provider: Arc::new(provider),
+        provider,
         cache: Mutex::new(None),
         max_block_range,
         client,
@@ -1302,7 +1429,23 @@ pub async fn create_client(
         block_poll_frequency,
         address_filtering,
         chain_state_notification,
+        shared_tip_logs,
     }))
+}
+
+/// Builds the network's shared tip-block cache and logs the boot line operators grep for.
+fn shared_tip_logs_handle(
+    chain: Chain,
+    provider: Arc<RindexerProvider>,
+    settings: SharedTipLogsSettings,
+) -> Arc<SharedTipLogs> {
+    let network = chain.to_string();
+    info!(
+        "shared tip logs enabled for {network} (empty_retry_deadline_ms={}, cache_blocks={}, bloom_trusted={})",
+        settings.empty_retry_deadline_ms, settings.cache_blocks, settings.bloom_trusted
+    );
+    let source = RpcBlockLogsSource { network: network.clone(), provider };
+    SharedTipLogs::new(&network, Arc::new(source), settings)
 }
 
 pub async fn get_chain_id(rpc_url: &str) -> Result<U256, RpcError<TransportErrorKind>> {
@@ -1317,7 +1460,7 @@ pub async fn get_chain_id(rpc_url: &str) -> Result<U256, RpcError<TransportError
 pub struct CreateNetworkProvider {
     pub network_name: String,
     pub disable_logs_bloom_checks: bool,
-    pub client: Arc<JsonRpcCachedProvider>,
+    pub client: Arc<dyn ChainProvider>,
 }
 
 impl CreateNetworkProvider {
@@ -1347,8 +1490,13 @@ impl CreateNetworkProvider {
                 network.rpc.clone()
             };
 
+            ensure_rpc_url_not_empty(
+                format!("`{}` (chain_id {})", network.name, network.chain_id),
+                &provider_url,
+            )?;
+
             // create the provider
-            let provider = create_client(
+            let provider = create_client_with_shared_tip_logs(
                 &provider_url,
                 &network.fallback_rpcs,
                 network.chain_id,
@@ -1358,13 +1506,30 @@ impl CreateNetworkProvider {
                 manifest.get_custom_headers(),
                 network.get_logs_settings.clone().map(|settings| settings.address_filtering),
                 reth_tx.clone(),
+                SharedTipLogsSettings::resolve(network),
             )
             .await?;
+
+            // When hypersync is configured, historical log fetching is served by
+            // HyperSync with the RPC provider handling everything else.
+            let client: Arc<dyn ChainProvider> = match &network.hypersync {
+                Some(hypersync_config) => {
+                    crate::hypersync::create_hypersync_provider(
+                        hypersync_config,
+                        &network.name,
+                        network.chain_id,
+                        network.max_block_range,
+                        provider,
+                    )
+                    .await?
+                }
+                None => provider,
+            };
 
             Ok::<_, RetryClientError>(CreateNetworkProvider {
                 network_name: network.name.clone(),
                 disable_logs_bloom_checks: network.disable_logs_bloom_checks.unwrap_or_default(),
-                client: provider,
+                client,
             })
         });
 
@@ -1373,7 +1538,7 @@ impl CreateNetworkProvider {
 
     /// Get the chain state notification for this network
     pub fn chain_state_notification(&self) -> Option<Sender<ChainStateNotification>> {
-        self.client.chain_state_notification.clone()
+        self.client.chain_state_notification()
     }
 }
 
@@ -1432,6 +1597,66 @@ mod tests {
         let mock: Box<dyn ChainProvider> = Box::new(MockChainProvider::new(1).with_block_number(7));
         let num = mock.get_block_number().await.unwrap();
         assert_eq!(num, U64::from(7));
+    }
+
+    #[tokio::test]
+    async fn create_client_rejects_empty_rpc_url_before_url_parsing() {
+        let error = create_client("", &[], 1301, None, None, None, HeaderMap::new(), None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RetryClientError::RpcUrlEmpty { .. }));
+        let message = error.to_string();
+        assert!(message.contains("chain_id 1301"));
+        assert!(message.contains(".env"));
+        assert!(!message.contains("relative URL without a base"));
+    }
+
+    #[tokio::test]
+    async fn create_network_provider_rejects_empty_rpc_url_with_network_context() {
+        let manifest: Manifest = serde_yaml::from_str(
+            r#"
+            name: foundry
+            project_type: no-code
+            networks:
+              - name: unichain_sepolia
+                chain_id: 1301
+                rpc: ""
+            contracts: []
+            "#,
+        )
+        .unwrap();
+
+        let error = CreateNetworkProvider::create(&manifest).await.unwrap_err();
+
+        assert!(matches!(error, RetryClientError::RpcUrlEmpty { .. }));
+        let message = error.to_string();
+        assert!(message.contains("`unichain_sepolia` (chain_id 1301)"));
+        assert!(message.contains(".env"));
+        assert!(!message.contains("relative URL without a base"));
+    }
+
+    #[test]
+    fn validate_manifest_network_rpc_urls_rejects_empty_rpc_url_with_network_context() {
+        let manifest: Manifest = serde_yaml::from_str(
+            r#"
+            name: foundry
+            project_type: no-code
+            networks:
+              - name: unichain_sepolia
+                chain_id: 1301
+                rpc: "   "
+            contracts: []
+            "#,
+        )
+        .unwrap();
+
+        let error = validate_manifest_network_rpc_urls(&manifest).unwrap_err();
+
+        assert!(matches!(error, RetryClientError::RpcUrlEmpty { .. }));
+        let message = error.to_string();
+        assert!(message.contains("`unichain_sepolia` (chain_id 1301)"));
+        assert!(message.contains(".env"));
     }
 
     fn make_block(number: u64) -> AnyRpcBlock {

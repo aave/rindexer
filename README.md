@@ -2,14 +2,11 @@
 
 [![codecov](https://codecov.io/gh/joshstevens19/rindexer/graph/badge.svg)](https://codecov.io/gh/joshstevens19/rindexer)
 
-Note rindexer is brand new and actively under development, things will change and bugs will exist - if you find any bugs or have any
-feature requests please open an issue on [github](https://github.com/joshstevens19/rindexer/issues).
-
 rindexer is an opensource powerful, high-speed indexing toolset developed in Rust, designed for compatibility with any EVM chain.
 This tool allows you to index chain events using a simple YAML file, requiring no additional coding.
 For more advanced needs, the rindexer provides foundations and advanced capabilities to build whatever you want.
 It's highly extendable, enabling you to construct indexing pipelines with ease and focus exclusively on the logic.
-rindexer out the box also gives you a GraphQL API to query the data you have indexed instantly.
+rindexer out the box also gives you a GraphQL API to query the data you have indexed instantly. 
 
 You can get to the full rindexer [documentation](https://rindexer.xyz/).
 
@@ -112,6 +109,9 @@ https://crates.io/crates/rindexer
 
 rindexer supports any EVM chain out of the box. If you have a custom chain, you can easily add support for it by
 adding the chain's RPC URL to the YAML configuration file and defining the chain ID. No code changes are required.
+
+For faster historical backfills, a network can also fetch event logs from [HyperSync](https://rindexer.xyz/docs/references/rpc-node-providers#hypersync)
+by adding `hypersync: true`. The RPC URL is still used for everything else.
 
 ## Code structure
 

@@ -16,7 +16,8 @@ use tracing::{debug, error, info, warn};
 use crate::helpers::is_relevant_block;
 use crate::indexer::heartbeat::{HeartbeatAction, HeartbeatTracker};
 use crate::indexer::reorg::{
-    detect_and_handle_reorg, reorg_safe_distance_for_chain, ReorgContext, ReorgCoordinator,
+    detect_and_handle_reorg, event_writer_barrier, reorg_safe_distance_for_chain, ReorgContext,
+    ReorgCoordinator,
 };
 use crate::metrics::indexing as metrics;
 use crate::provider::ChainProvider;
@@ -493,6 +494,7 @@ async fn live_indexing_for_contract_event_dependencies(
     let generation_cancel = events.first().map(|(config, _)| config.cancel_token().clone());
 
     let reorg_coordinator = reorg_coordinator;
+    let writer_barrier = event_writer_barrier(&network);
 
     let (pg_client, ch_client, event_registry) = events
         .first()
@@ -719,6 +721,10 @@ async fn live_indexing_for_contract_event_dependencies(
                     .lock()
                     .await = ordering_live_indexing_details;
 
+                // No event task spawns on this skip path, but the checkpoint write below
+                // must still be tracked so graceful shutdown waits for it.
+                let _writer_guard = writer_barrier.read().await;
+                indexing_event_processing();
                 update_progress_and_last_synced_task(
                     Arc::clone(config),
                     to_block,
@@ -911,7 +917,7 @@ async fn trigger_event(
         // Guard: never advance persisted progress to/past a range an earlier batch gave up on.
         // Without this, the DB update (which is monotonic-forward) would let this later success
         // push `last_synced_block` beyond the un-committed window, silently skipping it.
-        if let Some(floor) = give_up_floor(&config.id()) {
+        if let Some(floor) = give_up_floor(config.id()) {
             if to_block >= floor {
                 warn!(
                     "{} - progress pinned below block {} - an earlier batch exhausted its retries; not advancing last_synced_block past the un-committed range (restart to replay it)",
@@ -923,14 +929,21 @@ async fn trigger_event(
             }
         }
 
-        // TODO: There is a double-index race condition here. If we get a crash or failure between
-        //       triggering the event and syncing the last updated block, we may double index.
+        // Double-index race NOTE: for the no-code POSTGRES-sole-sink path this is
+        // closed — no_code_callback commits [batch + rindexer_internal cursor] in
+        // ONE transaction (insert_bulk_with_cursor), so this async advance is only
+        // the empty-range / tail bump (monotonic guard makes it a no-op otherwise).
+        // The race window still exists for: ClickHouse/CSV(-alongside-PG) and
+        // streams/chat configs (deliberately kept legacy — see atomic_pg_cursor
+        // in no_code.rs), custom Rust handlers, the trace path (its outer
+        // advance ignores the callback result), and factory discovery events
+        // (child-address bookkeeping commits after the callback).
         update_progress_and_last_synced_task(config, to_block, indexing_event_processed).await;
     } else {
         // A non-empty batch that gave up while still running (i.e. exhausted RINDEXER_MAX_EVENT_RETRIES,
         // not a shutdown) records a floor so subsequent successful ranges can't skip past it.
         if !fn_data.is_empty() && is_running() && !config.cancel_token().is_cancelled() {
-            record_give_up_floor(&config.id(), from_block);
+            record_give_up_floor(config.id(), from_block);
             warn!(
                 "{} - batch {} - {} exhausted its retries; pinning progress below block {} so it isn't silently skipped",
                 config.info_log_name(),
@@ -956,6 +969,9 @@ async fn handle_logs_result(
                 return Ok(tokio::spawn(async {}));
             }
 
+            let writer_guard =
+                event_writer_barrier(&config.network_contract().network).read_owned().await;
+
             debug!("{} - Processing {} logs", config.info_log_name(), result.logs.len());
 
             let fn_data = result
@@ -973,12 +989,14 @@ async fn handle_logs_result(
 
             if let Ok(permit) = callback_permits.clone().acquire_owned().await {
                 let task = tokio::spawn(async move {
+                    let _writer_guard = writer_guard;
                     trigger_event(config, fn_data, result.from_block, result.to_block).await;
                     drop(permit)
                 });
 
                 Ok(task)
             } else {
+                let _writer_guard = writer_guard;
                 trigger_event(config, fn_data, result.from_block, result.to_block).await;
                 Ok(tokio::spawn(async {}))
             }

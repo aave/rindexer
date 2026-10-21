@@ -146,11 +146,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
-use alloy::primitives::{Address, Bytes, B256, U256, U64};
+use alloy::primitives::{Address, Bytes, B256, I256, U256, U64};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
+use tokio_postgres::Transaction as PgTransaction;
 use tracing::{debug, info, warn};
 
 use crate::adaptive_concurrency::is_rate_limited_or_unavailable;
@@ -163,8 +164,9 @@ use crate::database::clickhouse::client::ClickhouseClient;
 use crate::database::generate::generate_indexer_contract_schema_name;
 use crate::database::generate::generate_table_full_name;
 use crate::database::postgres::batch_operations::execute_dynamic_batch_operation;
-use crate::database::postgres::client::PostgresClient;
+use crate::database::postgres::client::{pg_error_to_string, PostgresClient};
 use crate::database::postgres::generate::generate_internal_event_table_name;
+use crate::database::postgres::write_mode::PgWriteMode;
 use crate::database::sql_type_wrapper::EthereumSqlTypeWrapper;
 use crate::event::{
     evaluate_arithmetic, filter_by_expression, parse_filter_expression, ComputedValue,
@@ -1439,6 +1441,41 @@ impl TableRuntime {
             full_table_name,
             indexer_name: indexer_name.to_string(),
             contract_name: contract_name.to_string(),
+        }
+    }
+}
+
+/// Warns when a column used by an add/subtract upsert has a `default` that
+/// can't be canonicalized to a numeric literal (e.g. `1e18`). Postgres may
+/// accept such a default in DDL, but rows created by the arithmetic upsert
+/// would start from 0 instead — surfacing the divergence beats silently
+/// computing wrong balances. Called once per table during manifest column
+/// resolution; requires column types to be resolved first.
+pub(crate) fn warn_on_unusable_arithmetic_defaults(table: &Table, table_label: &str) {
+    for operation in table.all_operations() {
+        // Only upserts create rows via the arithmetic insert path
+        if operation.operation_type != OperationType::Upsert {
+            continue;
+        }
+        for set_col in &operation.set {
+            if !matches!(
+                set_col.action,
+                SetAction::Add | SetAction::Subtract | SetAction::Increment | SetAction::Decrement
+            ) {
+                continue;
+            }
+            let Some(column) = table.columns.iter().find(|c| c.name == set_col.column) else {
+                continue;
+            };
+            let Some(default) = column.default.as_deref() else { continue };
+            if arithmetic_insert_default(default, column.resolved_type()).is_none() {
+                warn!(
+                    "{}: column '{}' has default '{}' which is not a plain numeric literal; \
+                     rows created by the '{:?}' operation will start from 0 instead of the \
+                     default. Use a plain decimal value (e.g. \"1000000000000000000\").",
+                    table_label, column.name, default, set_col.action
+                );
+            }
         }
     }
 }
@@ -3457,30 +3494,50 @@ fn expand_iterate_bindings(
     Some(result)
 }
 
-/// Processes table operations for a batch of events.
+/// One custom-table operation with its rows fully resolved, ready to be written.
+///
+/// Built by [`prepare_table_operations`] without touching the database and consumed by
+/// [`apply_table_operations`] in either write mode.
+pub(crate) struct PreparedOperation<'t> {
+    /// The table the operation targets.
+    pub(crate) table: &'t TableRuntime,
+    /// The manifest operation (upsert, insert, update or delete) to run.
+    pub(crate) operation: &'t TableOperation,
+    /// Rows materialized from the event batch (`iterate` fan-out and filters applied).
+    pub(crate) rows: Vec<TableRowData>,
+    /// SQL condition for `@table` references, evaluated by the database at apply time.
+    pub(crate) sql_condition: Option<String>,
+    /// Highest block number per network among `rows`, for the shutdown checkpoint.
+    pub(crate) batch_max_blocks: HashMap<String, u64>,
+}
+
+/// Every operation of a batch that produced rows, in manifest order.
+pub(crate) struct PreparedTableOps<'t> {
+    pub(crate) ops: Vec<PreparedOperation<'t>>,
+}
+
+/// Resolves the rows of every table operation for a batch of events.
+///
+/// Does the RPC work (block timestamps, `$call` / `$call_static` via Multicall3), the
+/// `iterate` fan-out, filters and value resolution. No database access and no progress
+/// checkpoints: nothing is written here, so a shutdown returns `Err("Shutdown requested")`
+/// with nothing to record.
 ///
 /// # Arguments
 /// * `tables` - The table configurations
 /// * `event_name` - The name of the event being processed
 /// * `events_data` - Batch of events with (log_params, network, tx_metadata)
-/// * `postgres` - Optional PostgreSQL client
-/// * `clickhouse` - Optional ClickHouse client
 /// * `providers` - RPC providers for view calls (keyed by network name)
 /// * `constants` - User-defined constants from the manifest (can be network-scoped)
 /// * `multicall_addresses` - Custom Multicall3 addresses per network (None = use default address)
-/// * `checkpoint_config` - Optional config for checkpointing progress on shutdown
-#[allow(clippy::too_many_arguments)]
-pub async fn process_table_operations(
-    tables: &[TableRuntime],
+pub(crate) async fn prepare_table_operations<'t>(
+    tables: &'t [TableRuntime],
     event_name: &str,
     events_data: &[(Vec<LogParam>, String, TxMetadata)], // (log_params, network, tx_metadata)
-    postgres: Option<Arc<PostgresClient>>,
-    clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
     constants: &Constants,
     multicall_addresses: &HashMap<String, Option<String>>,
-    checkpoint_config: Option<&ProgressCheckpointConfig>,
-) -> Result<(), String> {
+) -> Result<PreparedTableOps<'t>, String> {
     // Exit early if shutdown requested before we start - no progress to save
     if !is_running() {
         info!("Shutdown requested - skipping table processing");
@@ -3555,37 +3612,19 @@ pub async fn process_table_operations(
         }
     }
 
-    // Track the max block number written per network - used for checkpointing on shutdown
-    let mut max_block_written_per_network: HashMap<String, u64> = HashMap::new();
+    let mut ops: Vec<PreparedOperation<'t>> = Vec::new();
 
     for table_runtime in tables {
-        // Check for shutdown before processing each table
+        // Check for shutdown before resolving each table - nothing has been written yet
         if !is_running() {
-            // Only checkpoint if we've actually written data to the database
-            if !max_block_written_per_network.is_empty() {
-                if let Some(checkpoint) = checkpoint_config {
-                    for (network, max_block) in &max_block_written_per_network {
-                        info!(
-                            "Shutdown - checkpointing block {} for {} (last block written)",
-                            max_block, network
-                        );
-                        checkpoint.checkpoint(network, *max_block).await;
-                    }
-                }
-            } else {
-                info!(
-                    "Shutdown during table processing - no data written yet, skipping checkpoint"
-                );
-            }
+            info!("Shutdown during table processing - no data written yet, skipping checkpoint");
             return Err("Shutdown requested".to_string());
         }
 
         // Find operations for this event
-        let event_mapping = table_runtime.table.events.iter().find(|e| e.event == event_name);
-
-        let event_mapping = match event_mapping {
-            Some(em) => em,
-            None => continue,
+        let Some(event_mapping) = table_runtime.table.events.iter().find(|e| e.event == event_name)
+        else {
+            continue;
         };
 
         for operation in &event_mapping.operations {
@@ -3615,20 +3654,8 @@ pub async fn process_table_operations(
                 };
 
             for (log_params, network, tx_metadata) in events_data {
-                // Check for shutdown before processing each event - exit quickly
+                // Check for shutdown before resolving each event - exit quickly, nothing written yet
                 if !is_running() {
-                    // Checkpoint what we've written so far
-                    if !max_block_written_per_network.is_empty() {
-                        if let Some(checkpoint) = checkpoint_config {
-                            for (net, max_block) in &max_block_written_per_network {
-                                info!(
-                                    "Shutdown - checkpointing block {} for {} (mid-batch)",
-                                    max_block, net
-                                );
-                                checkpoint.checkpoint(net, *max_block).await;
-                            }
-                        }
-                    }
                     return Err("Shutdown requested".to_string());
                 }
 
@@ -3787,62 +3814,191 @@ pub async fn process_table_operations(
                 continue;
             }
 
-            // Execute the operation
-            if let Some(postgres) = &postgres {
-                execute_postgres_operation(
-                    postgres,
-                    &table_runtime.full_table_name,
-                    &table_runtime.table,
-                    operation,
-                    &rows_to_process,
-                    sql_condition.as_deref(),
-                )
-                .await?;
+            ops.push(PreparedOperation {
+                table: table_runtime,
+                operation,
+                rows: rows_to_process,
+                sql_condition,
+                batch_max_blocks,
+            });
+        }
+    }
 
-                // Journal non-reversible operations (Set/Max/Min) for reorg recalculation
-                journal_non_reversible_ops(
-                    postgres,
-                    &table_runtime.full_table_name,
-                    operation,
-                    &rows_to_process,
-                )
+    Ok(PreparedTableOps { ops })
+}
+
+/// Writes prepared operations to the configured databases.
+///
+/// `Eager` keeps the per-operation commit: each operation runs in its own
+/// transaction(s), the reorg journal is best-effort autocommit, and a shutdown
+/// detected between operations checkpoints the last block written (when
+/// `checkpoint_config` is set) before returning `Err("Shutdown requested")`.
+///
+/// `Tx` stages every statement in the caller's open transaction: no shutdown checks,
+/// no checkpoints and no ClickHouse (both are rejected with `Err`); the caller commits
+/// or drops the transaction.
+pub(crate) async fn apply_table_operations(
+    prepared: &PreparedTableOps<'_>,
+    pg: Option<PgWriteMode<'_>>,
+    clickhouse: Option<Arc<ClickhouseClient>>,
+    checkpoint_config: Option<&ProgressCheckpointConfig>,
+) -> Result<(), String> {
+    let postgres = match pg {
+        Some(PgWriteMode::Tx(tx)) => {
+            if clickhouse.is_some() {
+                return Err("apply_table_operations: ClickHouse operations cannot join a Postgres transaction".to_string());
+            }
+            if checkpoint_config.is_some() {
+                return Err("apply_table_operations: shutdown checkpoints are not allowed inside a Postgres transaction".to_string());
+            }
+            return apply_table_operations_in_tx(prepared, tx).await;
+        }
+        Some(PgWriteMode::Eager(postgres)) => Some(postgres),
+        None => None,
+    };
+
+    // Track the max block number written per network - used for checkpointing on shutdown
+    let mut max_block_written_per_network: HashMap<String, u64> = HashMap::new();
+
+    for op in &prepared.ops {
+        // Check for shutdown before each operation
+        if !is_running() {
+            // Only checkpoint if we've actually written data to the database
+            if !max_block_written_per_network.is_empty() {
+                if let Some(checkpoint) = checkpoint_config {
+                    for (network, max_block) in &max_block_written_per_network {
+                        info!(
+                            "Shutdown - checkpointing block {} for {} (last block written)",
+                            max_block, network
+                        );
+                        checkpoint.checkpoint(network, *max_block).await;
+                    }
+                }
+            } else {
+                info!(
+                    "Shutdown during table processing - no data written yet, skipping checkpoint"
+                );
+            }
+            return Err("Shutdown requested".to_string());
+        }
+
+        // Execute the operation
+        if let Some(postgres) = postgres {
+            execute_postgres_operation(
+                PgWriteMode::Eager(postgres),
+                &op.table.full_table_name,
+                &op.table.table,
+                op.operation,
+                &op.rows,
+                op.sql_condition.as_deref(),
+            )
+            .await?;
+
+            // Journal non-reversible operations (Set/Max/Min) for reorg recalculation
+            journal_non_reversible_ops(postgres, &op.table.full_table_name, op.operation, &op.rows)
                 .await;
-            }
+        }
 
-            if let Some(clickhouse) = &clickhouse {
-                execute_clickhouse_operation(
-                    clickhouse,
-                    &table_runtime.full_table_name,
-                    &table_runtime.table,
-                    operation,
-                    &rows_to_process,
-                )
-                .await?;
+        if let Some(clickhouse) = &clickhouse {
+            execute_clickhouse_operation(
+                clickhouse,
+                &op.table.full_table_name,
+                &op.table.table,
+                op.operation,
+                &op.rows,
+            )
+            .await?;
 
-                journal_non_reversible_ops_clickhouse(
-                    clickhouse,
-                    &table_runtime.full_table_name,
-                    operation,
-                    &rows_to_process,
-                )
-                .await;
-            }
+            journal_non_reversible_ops_clickhouse(
+                clickhouse,
+                &op.table.full_table_name,
+                op.operation,
+                &op.rows,
+            )
+            .await;
+        }
 
-            // DB write succeeded - update max blocks written tracker
-            for (network, block) in &batch_max_blocks {
-                max_block_written_per_network
-                    .entry(network.clone())
-                    .and_modify(|max| {
-                        if *block > *max {
-                            *max = *block;
-                        }
-                    })
-                    .or_insert(*block);
-            }
+        // DB write succeeded - update max blocks written tracker
+        for (network, block) in &op.batch_max_blocks {
+            max_block_written_per_network
+                .entry(network.clone())
+                .and_modify(|max| {
+                    if *block > *max {
+                        *max = *block;
+                    }
+                })
+                .or_insert(*block);
         }
     }
 
     Ok(())
+}
+
+/// Stages every prepared operation and its journal row in `tx`; nothing commits here.
+async fn apply_table_operations_in_tx(
+    prepared: &PreparedTableOps<'_>,
+    tx: &PgTransaction<'_>,
+) -> Result<(), String> {
+    for op in &prepared.ops {
+        execute_postgres_operation(
+            PgWriteMode::Tx(tx),
+            &op.table.full_table_name,
+            &op.table.table,
+            op.operation,
+            &op.rows,
+            op.sql_condition.as_deref(),
+        )
+        .await?;
+
+        journal_non_reversible_ops_in_tx(tx, &op.table.full_table_name, op.operation, &op.rows)
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Processes table operations for a batch of events: prepare, then apply with
+/// per-operation commits (`PgWriteMode::Eager`).
+///
+/// # Arguments
+/// * `tables` - The table configurations
+/// * `event_name` - The name of the event being processed
+/// * `events_data` - Batch of events with (log_params, network, tx_metadata)
+/// * `postgres` - Optional PostgreSQL client
+/// * `clickhouse` - Optional ClickHouse client
+/// * `providers` - RPC providers for view calls (keyed by network name)
+/// * `constants` - User-defined constants from the manifest (can be network-scoped)
+/// * `multicall_addresses` - Custom Multicall3 addresses per network (None = use default address)
+/// * `checkpoint_config` - Optional config for checkpointing progress on shutdown
+#[allow(clippy::too_many_arguments)]
+pub async fn process_table_operations(
+    tables: &[TableRuntime],
+    event_name: &str,
+    events_data: &[(Vec<LogParam>, String, TxMetadata)], // (log_params, network, tx_metadata)
+    postgres: Option<Arc<PostgresClient>>,
+    clickhouse: Option<Arc<ClickhouseClient>>,
+    providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
+    constants: &Constants,
+    multicall_addresses: &HashMap<String, Option<String>>,
+    checkpoint_config: Option<&ProgressCheckpointConfig>,
+) -> Result<(), String> {
+    let prepared = prepare_table_operations(
+        tables,
+        event_name,
+        events_data,
+        providers,
+        constants,
+        multicall_addresses,
+    )
+    .await?;
+
+    apply_table_operations(
+        &prepared,
+        postgres.as_deref().map(PgWriteMode::Eager),
+        clickhouse,
+        checkpoint_config,
+    )
+    .await
 }
 
 /// Maps ColumnType to BatchOperationSqlType.
@@ -3868,6 +4024,30 @@ fn column_type_to_batch_sql_type(column_type: &ColumnType) -> BatchOperationSqlT
         ColumnType::Timestamp => BatchOperationSqlType::DateTime,
         // All array types use TEXT[] for simplicity
         ColumnType::Array(_) => BatchOperationSqlType::TextArray,
+    }
+}
+
+/// Canonicalizes a column's YAML `default` into a numeric SQL literal usable as
+/// the starting value of an arithmetic upsert (a row created by `subtract` must
+/// begin at `default - value`, not `+value`). Returns None for non-numeric
+/// types or unparseable values (callers fall back to 0), so no raw YAML string
+/// ever reaches the SQL text.
+fn arithmetic_insert_default(default: &str, column_type: &ColumnType) -> Option<String> {
+    let default = default.trim();
+    match column_type {
+        ColumnType::Uint8 | ColumnType::Uint16 | ColumnType::Uint32 | ColumnType::Uint64 => {
+            default.parse::<u64>().ok().map(|v| v.to_string())
+        }
+        ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::Int64 => {
+            default.parse::<i64>().ok().map(|v| v.to_string())
+        }
+        ColumnType::Uint128 | ColumnType::Uint256 => {
+            default.parse::<U256>().ok().map(|v| v.to_string())
+        }
+        ColumnType::Int128 | ColumnType::Int256 => {
+            default.parse::<I256>().ok().map(|v| v.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -3902,7 +4082,7 @@ fn operation_type_to_batch_type(op_type: &OperationType) -> BatchOperationType {
 ///   Used when the `if`/`filter` condition contains `@table` references.
 ///   E.g., conditions like `$value > @balance` become SQL `EXCLUDED.value > table.balance`.
 async fn execute_postgres_operation(
-    postgres: &PostgresClient,
+    mode: PgWriteMode<'_>,
     table_name: &str,
     table_def: &Table,
     operation: &TableOperation,
@@ -3970,13 +4150,27 @@ async fn execute_postgres_operation(
                 BatchOperationAction::Nothing
             };
 
-            columns.push(DynamicColumnDefinition::new(
-                column.name.clone(),
-                value,
-                column_type_to_batch_sql_type(column_type),
-                behavior,
-                action,
-            ));
+            // Arithmetic upserts start new rows from the column default
+            let insert_default =
+                if matches!(action, BatchOperationAction::Add | BatchOperationAction::Subtract) {
+                    column
+                        .default
+                        .as_deref()
+                        .and_then(|d| arithmetic_insert_default(d, column_type))
+                } else {
+                    None
+                };
+
+            columns.push(
+                DynamicColumnDefinition::new(
+                    column.name.clone(),
+                    value,
+                    column_type_to_batch_sql_type(column_type),
+                    behavior,
+                    action,
+                )
+                .with_insert_default(insert_default),
+            );
         }
 
         // Auto-injected metadata columns
@@ -4043,15 +4237,8 @@ async fn execute_postgres_operation(
     let short_table_name = table_name.split('.').next_back().unwrap_or(table_name);
     let event_name = format!("Tables::{}", short_table_name);
 
-    execute_dynamic_batch_operation(
-        postgres,
-        table_name,
-        op_type,
-        batch_rows,
-        &event_name,
-        sql_where,
-    )
-    .await?;
+    execute_dynamic_batch_operation(mode, table_name, op_type, batch_rows, &event_name, sql_where)
+        .await?;
 
     let op_label = match operation.operation_type {
         OperationType::Upsert => "UPSERT",
@@ -4252,7 +4439,16 @@ pub async fn execute_postgres_operation_internal(
     rows: &[TableRowData],
     sql_where: Option<&str>,
 ) -> Result<(), String> {
-    execute_postgres_operation(postgres, table_name, table_def, operation, rows, sql_where).await
+    // Cron operations run outside event callbacks and always commit on their own.
+    execute_postgres_operation(
+        PgWriteMode::Eager(postgres),
+        table_name,
+        table_def,
+        operation,
+        rows,
+        sql_where,
+    )
+    .await
 }
 
 /// Internal ClickHouse operation execution - used by cron scheduler.
@@ -4392,11 +4588,8 @@ async fn execute_view_call_for_cron_internal(
                 // Fallback for string type: some tokens (MKR) return bytes32 for symbol()/name()
                 // Try to decode as bytes32 and convert to string
                 if result_bytes.len() == 32 {
-                    if let Some(s) = try_bytes32_as_string(&result_bytes) {
-                        DynSolValue::String(s)
-                    } else {
-                        return None;
-                    }
+                    let s = try_bytes32_as_string(&result_bytes)?;
+                    DynSolValue::String(s)
                 } else {
                     return None;
                 }
@@ -4569,25 +4762,38 @@ fn collect_journal_values(
     value_tuples
 }
 
+/// Builds the Postgres `rindexer_internal.derived_op_log` INSERT for non-reversible
+/// (Set/Max/Min) operations, or `None` when there is nothing to journal.
+/// Batches all rows into a single statement.
+fn build_journal_sql(
+    derived_table: &str,
+    operation: &TableOperation,
+    rows: &[TableRowData],
+) -> Option<String> {
+    let values = collect_journal_values(derived_table, operation, rows, "''");
+    if values.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "INSERT INTO rindexer_internal.derived_op_log \
+         (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
+         VALUES {}",
+        values.join(", ")
+    ))
+}
+
 /// Journal non-reversible (Set/Max/Min) operations to Postgres `rindexer_internal.derived_op_log`.
-/// Batches all rows into a single INSERT statement.
+/// Autocommit on its own pool checkout; a failure is logged and swallowed.
 async fn journal_non_reversible_ops(
     postgres: &PostgresClient,
     derived_table: &str,
     operation: &TableOperation,
     rows: &[TableRowData],
 ) {
-    let values = collect_journal_values(derived_table, operation, rows, "''");
-    if values.is_empty() {
+    let Some(sql) = build_journal_sql(derived_table, operation, rows) else {
         return;
-    }
-
-    let sql = format!(
-        "INSERT INTO rindexer_internal.derived_op_log \
-         (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-         VALUES {}",
-        values.join(", ")
-    );
+    };
 
     if let Err(e) = postgres.batch_execute(&sql).await {
         tracing::error!(
@@ -4595,6 +4801,38 @@ async fn journal_non_reversible_ops(
             "Failed to journal non-reversible ops: {:?}", e
         );
     }
+}
+
+/// Journals non-reversible operations inside the caller's transaction, under a SQL savepoint.
+///
+/// Only the INSERT is best-effort: on failure it is logged with the eager path's text and
+/// rolled back to the savepoint so the batch continues. An error from `SAVEPOINT`,
+/// `ROLLBACK TO` or `RELEASE` propagates because the transaction is unusable after it.
+/// Separate round trips on purpose: in one simple-query string a failing INSERT would
+/// stop before `RELEASE` and leave the transaction aborted. One savepoint per operation,
+/// released on both paths: `ROLLBACK TO` keeps the savepoint defined, and a stale one
+/// would nest the next operation's `SAVEPOINT` one subtransaction deeper.
+async fn journal_non_reversible_ops_in_tx(
+    tx: &PgTransaction<'_>,
+    derived_table: &str,
+    operation: &TableOperation,
+    rows: &[TableRowData],
+) -> Result<(), String> {
+    let Some(sql) = build_journal_sql(derived_table, operation, rows) else {
+        return Ok(());
+    };
+
+    tx.batch_execute("SAVEPOINT rindexer_journal").await.map_err(|e| pg_error_to_string(&e))?;
+    if let Err(e) = tx.batch_execute(&sql).await {
+        tracing::error!(
+            table = %derived_table,
+            "Failed to journal non-reversible ops: {:?}", e
+        );
+        tx.batch_execute("ROLLBACK TO SAVEPOINT rindexer_journal")
+            .await
+            .map_err(|e| pg_error_to_string(&e))?;
+    }
+    tx.batch_execute("RELEASE SAVEPOINT rindexer_journal").await.map_err(|e| pg_error_to_string(&e))
 }
 
 /// Journal non-reversible (Set/Max/Min) operations to ClickHouse `rindexer_internal.derived_op_log`.
@@ -5754,5 +5992,131 @@ mod tests {
             &meta,
         );
         assert_eq!(result, Some("blk=42,log=3".to_string()));
+    }
+
+    #[test]
+    fn arithmetic_insert_default_canonicalizes_numeric_literals() {
+        // Accepted: plain decimals (trimmed), hex via alloy FromStr, signed values
+        assert_eq!(arithmetic_insert_default("0", &ColumnType::Uint256), Some("0".to_string()));
+        assert_eq!(arithmetic_insert_default(" 50 ", &ColumnType::Uint256), Some("50".to_string()));
+        assert_eq!(arithmetic_insert_default("0x10", &ColumnType::Uint256), Some("16".to_string()));
+        assert_eq!(
+            arithmetic_insert_default("1_000", &ColumnType::Uint256),
+            Some("1000".to_string())
+        );
+        assert_eq!(arithmetic_insert_default("-5", &ColumnType::Int64), Some("-5".to_string()));
+        assert_eq!(arithmetic_insert_default("-5", &ColumnType::Int256), Some("-5".to_string()));
+        assert_eq!(arithmetic_insert_default("255", &ColumnType::Uint8), Some("255".to_string()));
+
+        // Rejected (callers fall back to 0 and TableRuntime::new warns):
+        // negatives on unsigned types, scientific notation, non-numeric types
+        assert_eq!(arithmetic_insert_default("-5", &ColumnType::Uint64), None);
+        assert_eq!(arithmetic_insert_default("1e18", &ColumnType::Uint256), None);
+        assert_eq!(arithmetic_insert_default("abc", &ColumnType::Uint256), None);
+        assert_eq!(arithmetic_insert_default("0", &ColumnType::String), None);
+        assert_eq!(arithmetic_insert_default("true", &ColumnType::Bool), None);
+    }
+
+    /// End-to-end check of the YAML-declared upsert path against a real
+    /// Postgres: a `subtract` operation that creates the row must start from
+    /// the column default (`default - value`), and later deltas accumulate.
+    ///
+    /// Requires Docker.
+    #[tokio::test]
+    async fn yaml_subtract_upsert_creates_rows_from_column_default() {
+        use testcontainers::runners::AsyncRunner;
+        use testcontainers_modules::postgres::Postgres;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let table: Table = serde_yaml::from_str(
+            r#"
+name: balances
+columns:
+  - name: holder
+    type: string
+  - name: balance
+    type: uint256
+    default: "50"
+events:
+  - event: Transfer
+    operations:
+      - type: upsert
+        where:
+          holder: $from
+        set:
+          - column: balance
+            action: subtract
+            value: $value
+"#,
+        )
+        .expect("table yaml should parse");
+        let operation = &table.events[0].operations[0];
+
+        let container = Postgres::default().start().await.expect("failed to start postgres");
+        let port = container.get_host_port_ipv4(5432).await.expect("failed to get postgres port");
+        let postgres = {
+            let _guard = crate::database::postgres::client::TEST_DATABASE_URL_LOCK.lock().await;
+            std::env::set_var(
+                "DATABASE_URL",
+                format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres?sslmode=disable"),
+            );
+            PostgresClient::new().await.expect("failed to create postgres client")
+        };
+
+        postgres
+            .batch_execute(
+                "CREATE TABLE yaml_balances (
+                    network VARCHAR(50) NOT NULL,
+                    holder TEXT NOT NULL,
+                    balance NUMERIC NOT NULL DEFAULT 50,
+                    rindexer_sequence_id NUMERIC,
+                    PRIMARY KEY (network, holder)
+                )",
+            )
+            .await
+            .expect("failed to create yaml_balances table");
+
+        let row = |value: u64, seq: u128| TableRowData {
+            columns: HashMap::from([
+                ("holder".to_string(), EthereumSqlTypeWrapper::String("0xsender".to_string())),
+                ("balance".to_string(), EthereumSqlTypeWrapper::U256Numeric(U256::from(value))),
+                (
+                    injected_columns::RINDEXER_SEQUENCE_ID.to_string(),
+                    EthereumSqlTypeWrapper::U128(seq),
+                ),
+            ]),
+            network: "ethereum".to_string(),
+        };
+
+        // First touch is a debit: row must be created at 50 - 30 = 20
+        execute_postgres_operation(
+            PgWriteMode::Eager(&postgres),
+            "yaml_balances",
+            &table,
+            operation,
+            &[row(30, 1)],
+            None,
+        )
+        .await
+        .expect("first debit failed");
+        // Second debit accumulates: 20 - 25 = -5
+        execute_postgres_operation(
+            PgWriteMode::Eager(&postgres),
+            "yaml_balances",
+            &table,
+            operation,
+            &[row(25, 2)],
+            None,
+        )
+        .await
+        .expect("second debit failed");
+
+        let stored = postgres
+            .query_one("SELECT balance::TEXT AS balance FROM yaml_balances", &[])
+            .await
+            .expect("failed to query yaml_balances");
+        let balance: String = stored.get("balance");
+        assert_eq!(balance, "-5", "debits must apply against the column default");
     }
 }

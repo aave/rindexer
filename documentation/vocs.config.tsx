@@ -1,6 +1,7 @@
 import { defineConfig } from "vocs";
 
 export default defineConfig({
+  renderStrategy: "full-static",
   head: (
     <>
       <meta property="og:type" content="website" />
@@ -236,7 +237,10 @@ export default defineConfig({
     {
       text: "Advanced",
       items: [
-        { text: "From A Foundry Project - coming soon" },
+        {
+          text: "From A Foundry Project",
+          link: "/docs/advanced/from-a-foundry-project",
+        },
         { text: "From A Hardhat Project - coming soon" },
         { text: "Using Reth ExExes", link: "/docs/advanced/using-reth-exex" },
       ],
