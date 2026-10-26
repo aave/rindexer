@@ -1,0 +1,35 @@
+Cargo.lock
+  s_f701151b34795b::t_fcb479272972a5 2092,2109,2111,2151,2176,2200,2225,2243,2245,2248,2265,2267,2295-2314,2374,2394,2396,2411,2413,2422,2424,2570-2575,2714-2722,9149-9158,10061-10074,13213,13215,13243,13270,17539,17597-17606
+core/Cargo.toml
+  s_f701151b34795b::t_6113770e9bd959 15-16,26-27
+core/src/api/graphql.rs
+  s_f701151b34795b::t_263456873bf491 116-123
+core/src/database/postgres/client.rs
+  s_f701151b34795b::t_9c300077643d2e 7-8,14,52-54,73-75,80-103,158,163-168,174-177,199-203,205,211-212,216,244,254,258,310,634,894-921
+core/src/database/postgres/connection.rs
+  s_f701151b34795b::t_8cf44357b75c64 1-292
+core/src/database/postgres/connection_transport_tests.rs
+  s_f701151b34795b::t_7d92771a459408 1-176
+core/src/database/postgres/mod.rs
+  s_f701151b34795b::t_a20a7f592ad211 3
+documentation/docs/pages/docs/changelog.mdx
+  s_f701151b34795b::t_9b2eb1fd0faf50 5,12
+documentation/docs/pages/docs/start-building/yaml-config/storage.mdx
+  s_f701151b34795b::t_086e005ac6df6c 37-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d5a64f6cadb6cf76b8dd49ecba90bff0e69c48a2",
+  "prompts": {},
+  "sessions": {
+    "s_f701151b34795b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16286-41ca-74f2-b898-441badf41c52",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "euugeenee <eugene@aave.com>"
+    }
+  }
+}
