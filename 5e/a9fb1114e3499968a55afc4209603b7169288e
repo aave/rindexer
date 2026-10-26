@@ -1,0 +1,20 @@
+core/src/adaptive_concurrency.rs
+  s_c3d6fd1a25cb70::t_819c1d01032128 449-457
+  s_c3d6fd1a25cb70::t_dda25260682ae2 616-634
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "5ea9fb1114e3499968a55afc4209603b7169288e",
+  "prompts": {},
+  "sessions": {
+    "s_c3d6fd1a25cb70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a422931-2c4f-4821-9d6e-87fa6b4e018f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Mark Grothe <grothem@gmail.com>"
+    }
+  }
+}

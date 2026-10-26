@@ -1,0 +1,21 @@
+documentation/docs/pages/docs/changelog.mdx
+  s_3de47061c15bbb::t_d1ac5f7c6037b6 8
+core/src/indexer/fetch_logs.rs
+  s_3de47061c15bbb::t_0d204959ea3bd1 1400-1402,1424-1430,1434,1445,1453,2756-2808
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d1f3f0364059a2627a71c1f96b45bedc1a147bf0",
+  "prompts": {},
+  "sessions": {
+    "s_3de47061c15bbb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73d194cd-8794-4421-81a7-cb1dbc9c6306",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Jaggad <jack@aave.com>"
+    }
+  }
+}

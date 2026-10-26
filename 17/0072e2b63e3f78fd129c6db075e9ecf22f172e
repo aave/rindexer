@@ -1,0 +1,27 @@
+core/src/indexer/fetch_logs.rs
+  s_125e2398024efc::t_00b42862979a2f 1423
+  s_125e2398024efc::t_137cbe502e5a4e 1227-1228
+  s_125e2398024efc::t_b74ad0870752c1 1113-1116
+  s_125e2398024efc::t_a71ce96420d040 1296-1297
+  s_125e2398024efc::t_776b6253f88d86 1229
+  s_125e2398024efc::t_27f4e1fbfc9852 1111-1112
+  s_125e2398024efc::t_8a91aff33a2d53 1331-1360,1362
+core/src/indexer/last_synced.rs
+  s_125e2398024efc::t_13e4219a0c6882 319-321
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "170072e2b63e3f78fd129c6db075e9ecf22f172e",
+  "prompts": {},
+  "sessions": {
+    "s_125e2398024efc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b153661-a340-4ea2-9981-21459cacbfd6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jaggad <jack@turboclicks.com.au>"
+    }
+  }
+}
