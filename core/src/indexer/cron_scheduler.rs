@@ -209,6 +209,12 @@ pub enum CronSchedule {
     Cron(Box<croner::Cron>),
 }
 
+/// Parses a manifest cron expression, accepting step shorthands such as `5/5 * * * *` as well
+/// as the strict `5-59/5 * * * *` form.
+pub(crate) fn parse_cron(expr: &str) -> Result<croner::Cron, croner::errors::CronError> {
+    croner::parser::CronParser::builder().sloppy_ranges(true).build().parse(expr)
+}
+
 /// Factory configuration for cron tasks that operate on factory-indexed contracts.
 #[derive(Debug, Clone)]
 pub struct FactoryCronConfig {
@@ -298,7 +304,7 @@ impl CronScheduler {
                             }
                         }
                     } else if let Some(cron_expr) = &cron_entry.schedule {
-                        match cron_expr.parse::<croner::Cron>() {
+                        match parse_cron(cron_expr) {
                             Ok(cron) => CronSchedule::Cron(Box::new(cron)),
                             Err(e) => {
                                 error!(
@@ -1720,7 +1726,7 @@ mod cron_parsing_tests {
     use chrono::{DateTime, TimeZone, Utc};
 
     fn parse(expr: &str) -> Result<croner::Cron, croner::errors::CronError> {
-        expr.parse::<croner::Cron>()
+        super::parse_cron(expr)
     }
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
@@ -1778,6 +1784,11 @@ mod cron_parsing_tests {
         ] {
             assert!(parse(expr).is_err(), "expected `{expr}` to fail to parse");
         }
+    }
+
+    #[test]
+    fn step_shorthand_without_range_parses() {
+        assert!(parse("5/5 * * * *").is_ok());
     }
 
     // ---- Parsing: 6- and 7-field shapes -------------------------------------

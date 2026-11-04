@@ -15,6 +15,7 @@ use crate::{
     abi::ABIItem,
     event::{parse_arithmetic_expression, parse_filter_expression},
     helpers::{load_env_from_full_path, replace_env_variable_to_raw_name},
+    indexer::cron_scheduler::parse_cron,
     manifest::{
         core::{Manifest, ProjectType},
         network::Network,
@@ -729,7 +730,7 @@ fn validate_manifest(
                             }
                             (None, Some(schedule)) => {
                                 // Validate cron expression using croner crate
-                                if let Err(e) = schedule.parse::<croner::Cron>() {
+                                if let Err(e) = parse_cron(schedule) {
                                     return Err(ValidateManifestError::InvalidCronSchedule(
                                         schedule.clone(),
                                         table.name.clone(),

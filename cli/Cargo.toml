@@ -15,10 +15,11 @@ rindexer = { path = "../core" }
 # external dependencies
 alloy = { workspace = true }
 alloy-chains = { workspace = true } # pegged to version in "foundry-block-explorers"
-foundry-block-explorers = "0.22.0"
+# 0.23 and later turn on serde_json's arbitrary_precision for every crate built alongside rindexer.
+foundry-block-explorers = "=0.22.0"
 clap = { workspace = true }
 regex = { workspace = true }
-colored = "3.0.0"
+colored = "3.1.1"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,8 +27,9 @@ tempfile = { workspace = true }
 rustls = { workspace = true }
 
 # build
-jemallocator = { version = "0.6.1", package = "tikv-jemallocator", optional = true }
-jemalloc-ctl = { version = "0.6.1", package = "tikv-jemalloc-ctl", optional = true }
+# reth v2.1.0 links tikv-jemalloc-sys 0.6, and only one crate may link jemalloc.
+jemallocator = { version = "=0.6.1", package = "tikv-jemallocator", optional = true }
+jemalloc-ctl = { version = "=0.6.1", package = "tikv-jemalloc-ctl", optional = true }
 
 [profile.release]
 lto = "fat"
