@@ -176,7 +176,7 @@ impl AdaptiveConcurrency {
     /// compute-weight limiter is still throttling heavy calls, so layer-level
     /// successes must not clear backoff (see `layer_extensions.rs`).
     pub fn record_success_backoff_only(&self) {
-        let updated = self.backoff_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        let updated = self.backoff_ms.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             (cur > 0).then_some(cur * 3 / 4)
         });
         if let Ok(prev) = updated {
@@ -247,12 +247,12 @@ impl AdaptiveConcurrency {
         self.ever_rate_limited.store(true, Ordering::Relaxed);
         self.last_rate_limit_ms.store(self.now_millis(), Ordering::Relaxed);
 
-        // Increase backoff (double it, starting from 500ms, max 30s). Use fetch_update so
+        // Increase backoff (double it, starting from 500ms, max 30s). Use try_update so
         // concurrent callers can't drop the increase on a lost compare_exchange race.
         let max_backoff_ms = self.max_backoff_ms;
         let new_backoff = self
             .backoff_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(if cur == 0 {
                     INITIAL_BACKOFF_MS
                 } else {
@@ -386,13 +386,13 @@ impl AdaptiveConcurrency {
             return;
         }
         // Race-safe recovery: a `record_rate_limit` can still land in the tiny window
-        // between the re-check above and these writes. `fetch_update` re-reads the live
+        // between the re-check above and these writes. `try_update` re-reads the live
         // value on each attempt, so recovery steps *toward* its target from whatever is
         // current instead of clobbering a concurrent scale-down/backoff-increase with a
         // value derived from a stale read.
         let pre_backoff = self.backoff_ms.load(Ordering::Relaxed);
         let backoff_update =
-            self.backoff_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            self.backoff_ms.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 // A concurrent rate-limit that raised backoff past our read must win:
                 // don't undo it.
                 if cur == 0 || cur > pre_backoff {
@@ -424,10 +424,10 @@ impl AdaptiveConcurrency {
         // Step concurrency/batch up from the live value; no-op once at max. Stepping from
         // `cur` (not a stale read) means a concurrent scale-down is preserved — recovery
         // adds at most one step to whatever the rate-limit path left behind.
-        let _ = self.current.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        let _ = self.current.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             (cur < self.max).then(|| std::cmp::min(self.max, cur + std::cmp::max(1, cur / 5)))
         });
-        let _ = self.batch_size.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        let _ = self.batch_size.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             (cur < self.max_batch_size)
                 .then(|| std::cmp::min(self.max_batch_size, cur + std::cmp::max(5, cur / 5)))
         });
