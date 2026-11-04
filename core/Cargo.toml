@@ -14,43 +14,44 @@ include = ["src/**", "resources/**", "Cargo.toml", "build.rs"]
 [dev-dependencies]
 tempfile = { workspace = true }
 mockito = "1.7"
-testcontainers = "0.27"
+# testcontainers-modules 0.15 still requires testcontainers 0.27.
+testcontainers = "=0.27.3"
 testcontainers-modules = { version = "0.15", features = ["postgres", "clickhouse", "redis", "rabbitmq", "kafka"] }
 tokio-postgres = { workspace = true, features = ["with-serde_json-1"] }
-rust_decimal = { version = "1.41", features = ["db-tokio-postgres"] }
+rust_decimal = { version = "1.43", features = ["db-tokio-postgres"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [dependencies]
 alloy = { workspace = true, features = ["json-rpc", "eip712"] }
 async-rs = { version = "0.8", default-features = false, features = ["tokio"] }
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 aws-config = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false }
 aws-sdk-sns = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false }
 bb8 = "0.9"
 bb8-lapin = "0.8"
 bb8-postgres = "0.9.0"
 bb8-redis = "0.26"
-bytes = "1.10.1"
+bytes = "1.12.1"
 chrono = { version = "0.4", features = ["serde"] }
 colored = "3"
-croner = "3"
+croner = "4"
 csv = { workspace = true }
-clickhouse = { version = "0.15.0", features = ["rustls-tls"] }
+clickhouse = { version = "0.15.3", features = ["rustls-tls"] }
 dotenvy = "0.15"
 futures = "0.3"
 hex = { workspace = true }
-hypersync-client = "1.4.0"
+hypersync-client = "2.0.0"
 lapin = "4"
-lazy_static = "1.5.0"
-lru = "0.18"
+lazy_static = "1.5.1"
+lru = "0.19"
 once_cell = "1.21"
 rand = "0.10"
 # Redis version must match bb8-redis internal version. Can be removed in favor of just
 # bb8-redis once https://github.com/djc/bb8/pull/183 is merged.
-redis = { version = "1.2", features = ["streams"] }
+redis = { version = "1.8", features = ["streams"] }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["gzip"] }
-rust_decimal = { version = "1.41", features = ["db-tokio-postgres"] }
+rust_decimal = { version = "1.43", features = ["db-tokio-postgres"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -66,7 +67,7 @@ tokio-postgres = { workspace = true, features = [
     "with-chrono-0_4",
     "with-serde_json-1",
 ] }
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 rustls = { workspace = true }
 webpki-roots = "1"
 rustls-native-certs = "0.8"
@@ -74,16 +75,17 @@ tokio-stream = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["time"] }
 mini-moka = "0.10.3"
-url = "2.5.7"
+url = "2.5.8"
 uuid = "1"
-eyre = { version = "0.6.12" }
-cfg-if = "1.0.4"
-zstd = "0.13.3"
+eyre = { version = "0.6.14" }
+cfg-if = "1.0.5"
+# Stays on 0.13 to share one zstd with the arrow and parquet that hypersync-client pulls in.
+zstd = "0.13.4"
 # Pinned to 2.x: `bincode 3.0.0` is a tombstone (single `compile_error!` after
 # the maintainer announced the crate is unmaintained). Migration paths
 # (`wincode`, `postcard`) require touching the on-disk blockclock format;
 # tracked separately.
-bincode = "2.0.1"
+bincode = "=2.0.1"
 anyhow = { workspace = true }
 winnow = "1"
 tower = "0.5"
@@ -91,9 +93,11 @@ axum = "0.8"
 prometheus = { version = "0.14", default-features = false }
 
 # build
-jemallocator = { version = "0.6.1", package = "tikv-jemallocator", optional = true }
-jemalloc-ctl = { version = "0.6.1", package = "tikv-jemalloc-ctl", optional = true }
-foundry-compilers = "0.19.5"
+# reth v2.1.0 links tikv-jemalloc-sys 0.6, and only one crate may link jemalloc.
+jemallocator = { version = "=0.6.1", package = "tikv-jemallocator", optional = true }
+jemalloc-ctl = { version = "=0.6.1", package = "tikv-jemalloc-ctl", optional = true }
+# 0.20 and later turn on serde_json's arbitrary_precision for every crate built alongside rindexer.
+foundry-compilers = "=0.19.14"
 alloy-chains = { workspace = true }
 
 # reth
